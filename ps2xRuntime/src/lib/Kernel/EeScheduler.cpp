@@ -7,6 +7,7 @@
 #include <cassert>
 #include <cstring>
 #include <limits>
+#include <bit>
 #include <stdexcept>
 
 namespace
@@ -1769,6 +1770,15 @@ void EeScheduler::processPendingEvents()
         {
             dispatchIrq(false, 0u);
         }
+    }
+    // Interrupts devices raised from inside memory accesses (IPU, its DMA channels).
+    for (uint32_t pending = m_runtime.memory().takePendingIntc(); pending != 0u; pending &= pending - 1u)
+    {
+        dispatchIrq(false, static_cast<uint32_t>(std::countr_zero(pending)));
+    }
+    for (uint32_t pending = m_runtime.memory().takePendingDmac(); pending != 0u; pending &= pending - 1u)
+    {
+        dispatchIrq(true, static_cast<uint32_t>(std::countr_zero(pending)));
     }
     std::deque<EeEvent> pending;
     {

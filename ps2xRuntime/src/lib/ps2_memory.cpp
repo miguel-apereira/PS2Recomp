@@ -819,6 +819,12 @@ uint64_t PS2Memory::read64(uint32_t address)
         return loadScalar<uint64_t>(vuMem, vuOffset, vuLimit, "read64 vu", address);
     }
 
+    if (m_ipu && address >= 0x10002000u && address < 0x10002040u)
+    {
+        return static_cast<uint64_t>(m_ipu->readRegister(address - 0x10002000u)) |
+               (static_cast<uint64_t>(m_ipu->readRegister(address - 0x10002000u + 4u)) << 32);
+    }
+
     // 64-bit IO read: compose from the two adjacent 32-bit IO register slots
     // to avoid any side-effects from read32 handlers.
     if (isIoRegister(address))
@@ -1124,6 +1130,27 @@ void PS2Memory::write128(uint32_t address, __m128i value)
 
 bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 {
+    if (m_ipu)
+    {
+        if (address >= 0x10002000u && address < 0x10002040u)
+        {
+            m_ioRegisters[address] = value;
+            m_ipu->writeRegister(address - 0x10002000u, value);
+            serviceIpu();
+            return true;
+        }
+        if (address >= 0x10007010u && address < 0x10007020u) // IPU_in_FIFO
+        {
+            m_ipuInWords[(address >> 2) & 3u] = value;
+            if (address == 0x1000701Cu)
+            {
+                m_ipu->pushInput(reinterpret_cast<const uint8_t *>(m_ipuInWords), 1u);
+                serviceIpu();
+            }
+            return true;
+        }
+    }
+
     size_t timerIndex = 0u;
     uint32_t timerOffset = 0u;
     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
@@ -1305,6 +1332,12 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
             const uint32_t madr = m_ioRegisters[channelBase + 0x10];
             const uint32_t qwc = m_ioRegisters[channelBase + 0x20];
             m_dmaStartCount.fetch_add(1, std::memory_order_relaxed);
+
+            if (m_ipu && (channelBase == 0x1000B000u || channelBase == 0x1000B400u))
+            {
+                serviceIpu();
+                return true;
+            }
 
             if (tryProcessScratchpadDma(channelBase, value))
             {
@@ -2280,6 +2313,24 @@ int PS2Memory::pollDmaRegisters()
 
 uint32_t PS2Memory::readIORegister(uint32_t address)
 {
+    if (m_ipu)
+    {
+        if (address >= 0x10002000u && address < 0x10002040u)
+        {
+            return m_ipu->readRegister(address - 0x10002000u);
+        }
+        if (address >= 0x10007000u && address < 0x10007010u) // IPU_out_FIFO
+        {
+            if (address == 0x10007000u)
+            {
+                std::memset(m_ipuOutWords, 0, sizeof(m_ipuOutWords));
+                m_ipu->popOutput(reinterpret_cast<uint8_t *>(m_ipuOutWords), 1u);
+                serviceIpu();
+            }
+            return m_ipuOutWords[(address >> 2) & 3u];
+        }
+    }
+
     size_t timerIndex = 0u;
     uint32_t timerOffset = 0u;
     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
@@ -2540,5 +2591,88 @@ void PS2Memory::clearModifiedFlag(uint32_t address, uint32_t size)
                 region.modified[bitIndex] = false;
             }
         }
+    }
+}
+
+// DMA channels 3 (from IPU) and 4 (to IPU) in normal mode: a channel runs as
+// far as the IPU lets it, and finishes (CHCR.STR cleared, D_STAT.CIS set,
+// DMAC interrupt raised) once its QWC reaches zero.
+void PS2Memory::serviceIpu()
+{
+    if (!m_ipu)
+    {
+        return;
+    }
+
+    const auto finish = [this](uint32_t channelBase, uint32_t channel)
+    {
+        m_ioRegisters[channelBase] &= ~0x100u;
+        m_ioRegisters[0x1000E010u] |= 1u << channel;
+        m_pendingDmac.fetch_or(1u << channel, std::memory_order_acq_rel);
+    };
+    const auto guestPointer = [this](uint32_t address, uint32_t bytes) -> uint8_t *
+    {
+        const bool scratch = isScratchpad(address);
+        const uint32_t physical = translateAddress(address);
+        uint8_t *base = scratch ? m_scratchpad : m_rdram;
+        const uint32_t limit = scratch ? PS2_SCRATCHPAD_SIZE : PS2_RAM_SIZE;
+        return (physical < limit && bytes <= limit - physical) ? base + physical : nullptr;
+    };
+
+    for (bool progress = true; progress;)
+    {
+        progress = false;
+
+        // Channel 4: memory to the IPU input FIFO.
+        if (m_ioRegisters[0x1000B400u] & 0x100u)
+        {
+            const uint32_t madr = m_ioRegisters[0x1000B410u];
+            const uint32_t qwc = m_ioRegisters[0x1000B420u] & 0xFFFFu;
+            if (qwc != 0u)
+            {
+                if (const uint8_t *source = guestPointer(madr, qwc * 16u))
+                {
+                    m_ipu->pushInput(source, qwc);
+                }
+                m_ioRegisters[0x1000B410u] = madr + qwc * 16u;
+                m_ioRegisters[0x1000B420u] = 0u;
+            }
+            finish(0x1000B400u, 4u);
+            progress = true;
+        }
+
+        // Channel 3: the IPU output FIFO to memory.
+        if (m_ioRegisters[0x1000B000u] & 0x100u)
+        {
+            const uint32_t madr = m_ioRegisters[0x1000B010u];
+            const uint32_t qwc = m_ioRegisters[0x1000B020u] & 0xFFFFu;
+            const uint32_t count = std::min(qwc, m_ipu->outputAvailable());
+            if (count != 0u)
+            {
+                if (uint8_t *target = guestPointer(madr, count * 16u))
+                {
+                    markModified(madr, count * 16u);
+                    m_ipu->popOutput(target, count);
+                }
+                else
+                {
+                    std::vector<uint8_t> discard(count * 16u);
+                    m_ipu->popOutput(discard.data(), count);
+                }
+                m_ioRegisters[0x1000B010u] = madr + count * 16u;
+                m_ioRegisters[0x1000B020u] = qwc - count;
+                progress = true;
+            }
+            if ((m_ioRegisters[0x1000B020u] & 0xFFFFu) == 0u)
+            {
+                finish(0x1000B000u, 3u);
+                progress = true;
+            }
+        }
+    }
+
+    if (m_ipu->takeInterrupt())
+    {
+        m_pendingIntc.fetch_or(1u << 8, std::memory_order_acq_rel);
     }
 }

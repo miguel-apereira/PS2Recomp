@@ -1,6 +1,7 @@
 #ifndef PS2_MEMORY_H
 #define PS2_MEMORY_H
 
+#include "runtime/ps2_ipu.h"
 #include <cstddef>
 #include <cstdint>
 #include <array>
@@ -317,6 +318,13 @@ public:
     void setGifPacketCallback(GifPacketCallback cb) { m_gifPacketCallback = std::move(cb); }
     void setGifArbiter(GifArbiter *arbiter) { m_gifArbiter = arbiter; }
 
+    // Routes the IPU registers, FIFOs and DMA channels 3/4 to a host IPU.
+    void setIpuDevice(PS2IpuDevice *device) { m_ipu = device; }
+    // Interrupts raised by devices since the last call, as cause bit masks
+    // (INTC causes, DMAC channels). The EE scheduler dispatches them.
+    uint32_t takePendingIntc() { return m_pendingIntc.exchange(0u, std::memory_order_acq_rel); }
+    uint32_t takePendingDmac() { return m_pendingDmac.exchange(0u, std::memory_order_acq_rel); }
+
     using Vu1MscalCallback = std::function<void(uint32_t startPC, uint32_t top, uint32_t itop)>;
     void setVu1MscalCallback(Vu1MscalCallback cb) { m_vu1MscalCallback = std::move(cb); }
     using Vu1MscntCallback = std::function<void(uint32_t top, uint32_t itop)>;
@@ -399,6 +407,13 @@ public:
 
     GifPacketCallback m_gifPacketCallback;
     GifArbiter *m_gifArbiter = nullptr;
+    PS2IpuDevice *m_ipu = nullptr;
+    uint32_t m_ipuInWords[4] = {};
+    uint32_t m_ipuOutWords[4] = {};
+    std::atomic<uint32_t> m_pendingIntc{0};
+    std::atomic<uint32_t> m_pendingDmac{0};
+
+    void serviceIpu();
     Vu1MscalCallback m_vu1MscalCallback;
     Vu1MscntCallback m_vu1MscntCallback;
 
