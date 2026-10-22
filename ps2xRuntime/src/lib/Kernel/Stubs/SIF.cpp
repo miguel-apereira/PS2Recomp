@@ -1,6 +1,7 @@
 #include "Common.h"
 #include "SIF.h"
 #include "../Syscalls/RPC.h"
+#include "../Syscalls/Thread.h"
 #include "../../ps2_iop_transport.h"
 #include "runtime/ps2_address.h"
 #include "runtime/ee_scheduler.h"
@@ -594,7 +595,12 @@ namespace ps2_stubs
 
     void sceSifRpcLoop(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        setReturnS32(ctx, 0);
+        // The SCE library never returns from here: it serves the queue, then
+        // sleeps until woken. The runtime does not deliver IOP-to-EE RPC
+        // requests yet, so the server thread only sleeps. Returning instead
+        // lands games in the endless loop that follows the call, which never
+        // yields and starves every other EE thread.
+        ps2_syscalls::SleepThread(rdram, ctx, runtime);
     }
 
     void sceSifSetCmdBuffer(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
