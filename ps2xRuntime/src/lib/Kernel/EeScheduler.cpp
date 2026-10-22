@@ -111,6 +111,7 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     m_timeSliceExpired = false;
     m_insideInterrupt = false;
     m_pendingEeTimerInterrupts = 0u;
+    m_gsIrqRaised = 0u;
     m_eeCycle = 0u;
     m_sliceEndCycle = kDefaultTimeSliceCycles;
     m_stopRequested.store(false, std::memory_order_release);
@@ -1753,6 +1754,20 @@ void EeScheduler::processPendingEvents()
         if ((timerInterrupts & (1u << timer)) != 0u)
         {
             dispatchIrq(false, 9u + timer);
+        }
+    }
+    {
+        // A GS SIGNAL or FINISH event raises INTC cause 0 when GS_IMR leaves it
+        // unmasked (SIGMSK, FINISHMSK). The handler clears the CSR bit, which
+        // re-arms the event.
+        GSRegisters &gs = m_runtime.memory().gs();
+        const uint32_t events = static_cast<uint32_t>(gs.csr.load(std::memory_order_acquire)) & 0x3u;
+        const uint32_t unmasked = events & ~static_cast<uint32_t>((gs.imr >> 8) & 0x3u);
+        const uint32_t rising = unmasked & ~m_gsIrqRaised;
+        m_gsIrqRaised = unmasked;
+        if (rising != 0u)
+        {
+            dispatchIrq(false, 0u);
         }
     }
     std::deque<EeEvent> pending;

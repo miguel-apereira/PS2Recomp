@@ -425,6 +425,7 @@ private:
     bool m_timeSliceExpired = false;
     bool m_insideInterrupt = false;
     uint32_t m_pendingEeTimerInterrupts = 0;
+    uint32_t m_gsIrqRaised = 0; // GS CSR events already raised as INTC cause 0
     uint64_t m_eeCycle = 0;
     uint64_t m_sliceEndCycle = kDefaultTimeSliceCycles;
     std::thread::id m_executorThread{};
