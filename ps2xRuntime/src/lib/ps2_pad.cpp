@@ -25,10 +25,12 @@ namespace
     constexpr uint16_t PAD_L2 = 0x0100u;
 }
 
-bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t size)
+bool PSPadBackend::readState(int port, int slot, uint8_t *data, size_t size)
 {
     if (!data || size < 32)
         return false;
+    if (m_hostReader)
+        return m_hostReader(port, slot, data, size);
 
     std::memset(data, 0, 32);
     data[0] = 0x01;
