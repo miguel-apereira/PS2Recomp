@@ -231,6 +231,7 @@ namespace ps2_syscalls
         if (!g_rpc_initialized)
         {
             g_rpc_servers.clear();
+            g_rpc_ee_servers.clear();
             g_rpc_clients.clear();
             g_rpc_next_id = 1;
             g_rpc_packet_index = 0;
@@ -295,7 +296,8 @@ namespace ps2_syscalls
             g_rpc_clients[clientPtr].sid = rpcId;
         }
 
-        if (!serverPtr && PS2IopTransport::canBindRpc(runtime, rpcId))
+        const bool hostServer = runtime && runtime->findHostRpcServer(rpcId) != nullptr;
+        if (!serverPtr && (hostServer || PS2IopTransport::canBindRpc(runtime, rpcId)))
         {
             // EE-side servers and HLE routes need a descriptor in guest RAM.
             // With an emulated IOP, only publish it after the IRX has actually
@@ -543,7 +545,26 @@ namespace ps2_syscalls
             request.endFunction = endFunction;
             request.endParameter = endParameter;
 
-            iopResult = PS2IopTransport::handleRpc(runtime, rdram, ctx, request);
+            if (const PS2Runtime::HostRpcServer *hostServer = runtime ? runtime->findHostRpcServer(sid) : nullptr)
+            {
+                PS2Runtime::HostRpcCall call;
+                call.sid = sid;
+                call.function = rpcNum;
+                call.mode = mode;
+                call.send = sendBuf;
+                call.sendSize = sendSize;
+                call.receive = receiveBuffer;
+                call.receiveSize = receiveSize;
+                (*hostServer)(rdram, call);
+                iopResult.handled = true;
+                iopResult.resultAddress = receiveBuffer;
+                iopResult.signalNowaitCompletion = true;
+                iopResult.serverDispatchPolicy = ps2x::iop::ServerDispatchPolicy::Suppress;
+            }
+            else
+            {
+                iopResult = PS2IopTransport::handleRpc(runtime, rdram, ctx, request);
+            }
 
             if (iopResult.signalNowaitCompletion &&
                 (mode & kSifRpcModeNowait) != 0u)
@@ -785,20 +806,9 @@ namespace ps2_syscalls
                 }
             }
 
-            g_rpc_servers[sid] = {sid, sdPtr};
-            for (auto &entry : g_rpc_clients)
-            {
-                if (entry.second.sid == sid)
-                {
-                    t_SifRpcClientData *cd = reinterpret_cast<t_SifRpcClientData *>(getMemPtr(rdram, entry.first));
-                    if (cd)
-                    {
-                        cd->server = sdPtr;
-                        cd->buf = sd->buf;
-                        cd->cbuf = sd->cbuf;
-                    }
-                }
-            }
+            // Only the IOP calls EE-side servers; EE clients of the same SID
+            // talk to the IOP's server.
+            g_rpc_ee_servers[sid] = {sid, sdPtr};
         }
 
         RUNTIME_LOG("[SifRegisterRpc] sid=0x" << std::hex << sid << " sd=0x" << sdPtr << std::dec);
@@ -961,6 +971,58 @@ namespace ps2_syscalls
         }
 
         setReturnU32(ctx, 0);
+    }
+
+    bool callEeRpcServer(uint8_t *rdram, PS2Runtime *runtime, uint32_t sid, uint32_t function,
+                         const void *data, uint32_t size, PS2Runtime::EeRpcReturn onReturn)
+    {
+        uint32_t serverPtr = 0u;
+        {
+            std::lock_guard<std::mutex> lock(g_rpc_mutex);
+            const auto it = g_rpc_ee_servers.find(sid);
+            if (it != g_rpc_ee_servers.end())
+            {
+                serverPtr = it->second.sd_ptr;
+            }
+        }
+        const t_SifRpcServerData *server =
+            serverPtr ? reinterpret_cast<const t_SifRpcServerData *>(getMemPtr(rdram, serverPtr)) : nullptr;
+        if (!runtime || !server || !runtime->hasFunction(server->func))
+        {
+            return false;
+        }
+
+        if (size != 0u && data && server->buf != 0u)
+        {
+            uint8_t *const first = getMemPtr(rdram, server->buf);
+            uint8_t *const last = getMemPtr(rdram, server->buf + size - 1u);
+            if (!first || !last || static_cast<size_t>(last - first) != size - 1u)
+            {
+                return false;
+            }
+            std::memcpy(first, data, size);
+        }
+
+        GuestInvocation invocation{};
+        invocation.kind = GuestInvocationKind::RpcCallback;
+        invocation.tag = sid;
+        invocation.context = runtime->cpu();
+        invocation.context.pc = server->func;
+        SET_GPR_U32(&invocation.context, 4, function);
+        SET_GPR_U32(&invocation.context, 5, server->buf);
+        SET_GPR_U32(&invocation.context, 6, size);
+        SET_GPR_U32(&invocation.context, 7, 0u);
+        SET_GPR_U32(&invocation.context, 29, 0u);
+        SET_GPR_U32(&invocation.context, 31, 0u);
+        if (onReturn)
+        {
+            invocation.onComplete = [onReturn = std::move(onReturn), rdram](const R5900Context &completed, R5900Context &)
+            {
+                onReturn(rdram, getRegU32(&completed, 2));
+            };
+        }
+        runtime->eeScheduler().queueInvocation(std::move(invocation));
+        return true;
     }
 
     void sceSifCallRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

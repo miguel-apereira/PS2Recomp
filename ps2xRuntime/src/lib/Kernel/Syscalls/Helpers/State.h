@@ -205,7 +205,10 @@ static constexpr uint32_t kSifRpcDebugFlagUnhandled = 1u << 6;
 static constexpr uint32_t kSifRpcDebugFlagFallbackCopy = 1u << 7;
 static constexpr uint32_t kSifRpcDebugFlagFallbackZero = 1u << 8;
 
+// Servers EE clients bind to: the IOP's, or dummies for host replacements.
 inline std::unordered_map<uint32_t, RpcServerState> g_rpc_servers;
+// Servers the EE registered with sceSifRegisterRpc, which only the IOP calls.
+inline std::unordered_map<uint32_t, RpcServerState> g_rpc_ee_servers;
 inline std::unordered_map<uint32_t, RpcClientState> g_rpc_clients;
 inline SifRpcDebugEvent g_sif_rpc_debug_history[kSifRpcDebugHistoryCount]{};
 inline uint64_t g_sif_rpc_debug_next_seq = 0;

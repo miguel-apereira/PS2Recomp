@@ -10,6 +10,7 @@
 #include "Kernel/Stubs/Audio.h"
 #include "Kernel/Stubs/GS.h"
 #include "Kernel/Stubs/MPEG.h"
+#include "Kernel/Syscalls/RPC.h"
 #include "ps2_host_backend.h"
 #include "ps2_iop_host.h"
 #include "ps2x/iop/iop_subsystem.h"
@@ -564,8 +565,75 @@ PS2Runtime::~PS2Runtime()
     }
 }
 
+namespace
+{
+    // "cdrom0:\STREAM.IRX;1" -> "stream.irx"
+    std::string iopModuleFileName(std::string_view path)
+    {
+        const size_t slash = path.find_last_of("\\/:");
+        if (slash != std::string_view::npos)
+        {
+            path.remove_prefix(slash + 1);
+        }
+        const size_t version = path.find(';');
+        if (version != std::string_view::npos)
+        {
+            path = path.substr(0, version);
+        }
+        std::string name(path);
+        std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c)
+                       { return static_cast<char>(std::tolower(c)); });
+        return name;
+    }
+}
+
+void PS2Runtime::registerHostRpcServer(uint32_t sid, HostRpcServer server)
+{
+    m_hostRpcServers[sid] = std::move(server);
+}
+
+const PS2Runtime::HostRpcServer *PS2Runtime::findHostRpcServer(uint32_t sid) const
+{
+    const auto it = m_hostRpcServers.find(sid);
+    return it != m_hostRpcServers.end() ? &it->second : nullptr;
+}
+
+void PS2Runtime::registerHostIopModule(std::string fileName)
+{
+    m_hostIopModules.push_back(iopModuleFileName(fileName));
+}
+
+void PS2Runtime::addHostVBlankHandler(HostVBlankHandler handler)
+{
+    m_hostVBlankHandlers.push_back(std::move(handler));
+}
+
+void PS2Runtime::runHostVBlankHandlers(uint8_t *rdram)
+{
+    for (const HostVBlankHandler &handler : m_hostVBlankHandlers)
+    {
+        handler(rdram);
+    }
+}
+
+bool PS2Runtime::callEeRpcServer(uint32_t sid, uint32_t function, const void *data, uint32_t size, EeRpcReturn onReturn)
+{
+    return ps2_syscalls::callEeRpcServer(m_memory.getRDRAM(), this, sid, function, data, size, std::move(onReturn));
+}
+
 ps2x::iop::ModuleLoadResult PS2Runtime::loadIopModule(std::string_view path, const void *arguments, uint32_t argumentSize)
 {
+    const std::string fileName = iopModuleFileName(path);
+    if (std::find(m_hostIopModules.begin(), m_hostIopModules.end(), fileName) != m_hostIopModules.end())
+    {
+        ps2x::iop::ModuleLoadResult result;
+        result.handled = true;
+        result.moduleId = m_nextHostIopModuleId++;
+        result.startResult = 0;
+        std::cout << "[IOP] " << fileName << " replaced by host code, id=" << result.moduleId << std::endl;
+        return result;
+    }
+
     auto scope = m_iopHost->enterCall(nullptr, m_memory.getRDRAM());
     return m_iopSubsystem->loadModule(path, arguments, argumentSize);
 }

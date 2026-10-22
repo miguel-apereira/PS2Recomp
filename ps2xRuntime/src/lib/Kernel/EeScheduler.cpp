@@ -1901,6 +1901,7 @@ void EeScheduler::processEvent(const EeEvent &event)
             queueInvocation(std::move(invocation));
         }
         dispatchIrq(false, 2u);
+        m_runtime.runHostVBlankHandlers(m_rdram);
         break;
     case EeEventType::ExternalWake:
         completeExternalWait(event.id, event.value, KE_OK);

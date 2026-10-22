@@ -301,6 +301,41 @@ public:
     // Asks the guest to stop and waits for its thread.
     void stopGuest();
 
+    // ---- Host replacements for IOP modules ---------------------------------
+    // A game can replace an IRX module with native code: the EE binds and
+    // calls its RPC server as usual, and the replacement answers on the host.
+    // Servers, vblank handlers and callEeRpcServer() run on the EE executor
+    // thread, so they may read and write EE RAM directly.
+    struct HostRpcCall
+    {
+        uint32_t sid = 0;
+        uint32_t function = 0;
+        uint32_t mode = 0;
+        uint32_t send = 0;        // EE address of the request data
+        uint32_t sendSize = 0;
+        uint32_t receive = 0;     // EE address of the reply buffer
+        uint32_t receiveSize = 0;
+    };
+    // Writes its own reply into call.receive.
+    using HostRpcServer = std::function<void(uint8_t *rdram, const HostRpcCall &call)>;
+    using HostVBlankHandler = std::function<void(uint8_t *rdram)>;
+    using EeRpcReturn = std::function<void(uint8_t *rdram, uint32_t result)>;
+
+    // EE binds to sid succeed at once and every sceSifCallRpc on it goes to server.
+    void registerHostRpcServer(uint32_t sid, HostRpcServer server);
+    [[nodiscard]] const HostRpcServer *findHostRpcServer(uint32_t sid) const;
+    // sceSifLoadModule of an IRX with this file name (case-insensitive, any
+    // directory) reports success without loading or running the module.
+    void registerHostIopModule(std::string fileName);
+    // Runs on every vertical blank.
+    void addHostVBlankHandler(HostVBlankHandler handler);
+    void runHostVBlankHandlers(uint8_t *rdram);
+    // Calls the EE RPC server the game registered for sid with
+    // sceSifRegisterRpc, as the IOP would: data is copied into the server's
+    // buffer, then its function runs on the EE with (function, buffer, size).
+    // onReturn gets the function's return value. False if sid has no EE server.
+    bool callEeRpcServer(uint32_t sid, uint32_t function, const void *data, uint32_t size, EeRpcReturn onReturn = {});
+
     [[nodiscard]] ps2x::iop::ModuleLoadResult loadIopModule(std::string_view path, const void *arguments = nullptr, uint32_t argumentSize = 0);
     [[nodiscard]] ps2x::iop::ModuleLoadResult loadIopModuleBuffer(uint32_t guestAddress, const void *arguments = nullptr, uint32_t argumentSize = 0);
     [[nodiscard]] bool stopIopModule(int32_t moduleId, int32_t *result = nullptr);
@@ -532,6 +567,10 @@ private:
     std::atomic<bool> m_stopRequested{false};
     std::thread m_guestThread;
     std::atomic<bool> m_guestFinished{false};
+    std::unordered_map<uint32_t, HostRpcServer> m_hostRpcServers;
+    std::vector<std::string> m_hostIopModules;
+    std::vector<HostVBlankHandler> m_hostVBlankHandlers;
+    int32_t m_nextHostIopModuleId = 0x1000;
     DebugUiCallback m_debugUiInitCallback = nullptr;
     DebugUiCallback m_debugUiDrawCallback = nullptr;
     DebugUiCallback m_debugUiShutdownCallback = nullptr;

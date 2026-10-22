@@ -17,4 +17,8 @@ namespace ps2_syscalls
     void sceSifCallRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceSifSendCmd(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void sceRpcGetPacket(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+
+    // See PS2Runtime::callEeRpcServer.
+    bool callEeRpcServer(uint8_t *rdram, PS2Runtime *runtime, uint32_t sid, uint32_t function,
+                         const void *data, uint32_t size, PS2Runtime::EeRpcReturn onReturn);
 }
