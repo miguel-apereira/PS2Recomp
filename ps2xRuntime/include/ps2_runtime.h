@@ -18,6 +18,7 @@
 #include <atomic>
 #include <array>
 #include <mutex>
+#include <thread>
 #include <filesystem>
 #include <memory>
 #include <unordered_map>
@@ -285,10 +286,20 @@ public:
     PS2Runtime();
     ~PS2Runtime();
 
+    // Memory, subsystems and a raylib window with audio, for run().
     bool initialize(const char *title = "PS2 Game");
+    // Memory and subsystems only, for hosts that bring their own window and
+    // drive the guest with startGuest()/isGuestFinished()/stopGuest().
+    bool initializeCore();
     bool syncCoreSubsystems();
     bool loadELF(const std::string &elfPath);
+    // Runs the guest and presents its frames in the raylib window until either stops.
     void run();
+    // Starts the guest on its own thread and returns.
+    void startGuest();
+    bool isGuestFinished() const;
+    // Asks the guest to stop and waits for its thread.
+    void stopGuest();
 
     [[nodiscard]] ps2x::iop::ModuleLoadResult loadIopModule(std::string_view path, const void *arguments = nullptr, uint32_t argumentSize = 0);
     [[nodiscard]] ps2x::iop::ModuleLoadResult loadIopModuleBuffer(uint32_t guestAddress, const void *arguments = nullptr, uint32_t argumentSize = 0);
@@ -519,6 +530,8 @@ private:
     std::atomic<uint32_t> m_missingFunctionPolicy{static_cast<uint32_t>(MissingFunctionPolicy::ContinueToTarget)};
     std::atomic<bool> m_missingFunctionReported{false};
     std::atomic<bool> m_stopRequested{false};
+    std::thread m_guestThread;
+    std::atomic<bool> m_guestFinished{false};
     DebugUiCallback m_debugUiInitCallback = nullptr;
     DebugUiCallback m_debugUiDrawCallback = nullptr;
     DebugUiCallback m_debugUiShutdownCallback = nullptr;

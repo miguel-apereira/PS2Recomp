@@ -528,7 +528,7 @@ PS2Runtime::~PS2Runtime()
 {
     try
     {
-        requestStop();
+        stopGuest();
         m_iopSubsystem.reset();
         m_iopHost.reset();
 #if defined(PLATFORM_VITA)
@@ -713,7 +713,7 @@ bool PS2Runtime::syncCoreSubsystems()
     return true;
 }
 
-bool PS2Runtime::initialize(const char *title)
+bool PS2Runtime::initializeCore()
 {
     try
     {
@@ -728,6 +728,29 @@ bool PS2Runtime::initialize(const char *title)
             std::cerr << "Failed to bind runtime core subsystems" << std::endl;
             return false;
         }
+        return true;
+    }
+    catch (const std::exception &e)
+    {
+        std::cerr << "Failed to initialize PS2 runtime: " << e.what() << std::endl;
+    }
+    catch (...)
+    {
+        std::cerr << "Failed to initialize PS2 runtime: unknown exception" << std::endl;
+    }
+
+    return false;
+}
+
+bool PS2Runtime::initialize(const char *title)
+{
+    if (!initializeCore())
+    {
+        return false;
+    }
+
+    try
+    {
 #if defined(PLATFORM_VITA)
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
 #else
@@ -2339,7 +2362,7 @@ void PS2Runtime::HandleIntegerOverflow(R5900Context *ctx)
     raiseCop0Exception(ctx, EXCEPTION_INTEGER_OVERFLOW);
 }
 
-void PS2Runtime::run()
+void PS2Runtime::startGuest()
 {
     m_stopRequested.store(false, std::memory_order_relaxed);
     ps2_stubs::resetSifState();
@@ -2357,14 +2380,8 @@ void PS2Runtime::run()
 
     RUNTIME_LOG("Starting execution at address 0x" << std::hex << m_cpuContext.pc << std::dec);
 
-    // A blank image to use as a framebuffer
-    Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLANK);
-    Texture2D frameTex = LoadTextureFromImage(blank);
-    UnloadImage(blank);
-
-    std::atomic<bool> gameThreadFinished{false};
-
-    std::thread gameThread([&]()
+    m_guestFinished.store(false, std::memory_order_release);
+    m_guestThread = std::thread([this]()
                            {
         ThreadNaming::SetCurrentThreadName("GameThread");
         try
@@ -2383,10 +2400,34 @@ void PS2Runtime::run()
         {
             std::cerr << "Error during program execution: unknown exception" << std::endl;
         }
-        gameThreadFinished.store(true, std::memory_order_release); });
+        m_guestFinished.store(true, std::memory_order_release); });
+}
+
+bool PS2Runtime::isGuestFinished() const
+{
+    return m_guestFinished.load(std::memory_order_acquire);
+}
+
+void PS2Runtime::stopGuest()
+{
+    requestStop();
+    if (m_guestThread.joinable())
+    {
+        m_guestThread.join();
+    }
+}
+
+void PS2Runtime::run()
+{
+    startGuest();
+
+    // A blank image to use as a framebuffer
+    Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLANK);
+    Texture2D frameTex = LoadTextureFromImage(blank);
+    UnloadImage(blank);
 
     uint64_t tick = 0;
-    while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
+    while (!isStopRequested() && !isGuestFinished())
     {
         PS2_IF_AGRESSIVE_LOGS({
             tick++;
@@ -2454,11 +2495,7 @@ void PS2Runtime::run()
         }
     }
 
-    requestStop();
-    if (gameThread.joinable())
-    {
-        gameThread.join();
-    }
+    stopGuest();
 
     if (m_debugUiInitialized && m_debugUiShutdownCallback)
     {
