@@ -423,7 +423,9 @@ void EeScheduler::setupCurrentThread(uint32_t stack, uint32_t stackSize, uint32_
 int EeScheduler::createThread(const EeThreadCreateParams &params)
 {
     assertExecutor();
-    if (params.priority < 1 || params.priority >= kPriorityCount)
+    // Priority 0 is valid on the EE kernel: the main thread starts with it and
+    // games create threads at 0 (The Getaway's render thread).
+    if (params.priority < 0 || params.priority >= kPriorityCount)
     {
         return KE_ILLEGAL_PRIORITY;
     }
@@ -701,7 +703,7 @@ int EeScheduler::cancelWakeup(int id)
 int EeScheduler::changePriority(int id, int priority, bool interruptSafe, int &oldPriority)
 {
     assertExecutor();
-    if (priority < 1 || priority >= kPriorityCount)
+    if (priority < 0 || priority >= kPriorityCount)
     {
         return KE_ILLEGAL_PRIORITY;
     }
