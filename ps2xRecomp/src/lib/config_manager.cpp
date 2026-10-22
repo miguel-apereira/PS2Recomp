@@ -64,6 +64,7 @@ namespace ps2recomp
             config.patchSyscalls = toml::find_or<bool>(general, "patch_syscalls", config.patchSyscalls);
             config.patchCop0 = toml::find_or<bool>(general, "patch_cop0", config.patchCop0);
             config.patchCache = toml::find_or<bool>(general, "patch_cache", config.patchCache);
+            config.jalrIndirectFallback = toml::find_or<bool>(general, "jalr_indirect_fallback", config.jalrIndirectFallback);
 
             if (general.contains("stubs") && general.at("stubs").is_array())
             {
@@ -295,6 +296,7 @@ namespace ps2recomp
         general["patch_syscalls"] = config.patchSyscalls;
         general["patch_cop0"] = config.patchCop0;
         general["patch_cache"] = config.patchCache;
+        general["jalr_indirect_fallback"] = config.jalrIndirectFallback;
         general["skip"] = config.skipFunctions;
         general["stubs"] = config.stubImplementations;
         general["entry_points"] = config.entryPointHints;

@@ -184,6 +184,9 @@ namespace ps2recomp
         bool patchSyscalls = false;
         bool patchCop0 = true;
         bool patchCache = true;
+        // Promote every instruction of a function with an unresolved JALR to a
+        // resumable entry. Off: only unresolved JR (non-$ra) jumps do that.
+        bool jalrIndirectFallback = true;
         std::vector<std::string> skipFunctions;
         std::unordered_map<uint32_t, std::string> patches;
         std::vector<std::string> stubImplementations;

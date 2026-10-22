@@ -655,6 +655,34 @@ void register_code_generator_tests()
                   "unresolved JALR should not pretend it has a resolved local jump table");
     });
 
+    tc.Run("unresolved JALR keeps only its resume entry when JALR fallback is off", [](TestCase &t) {
+        Function func;
+        func.name = "unresolved_jalr_no_fallback";
+        func.start = 0x3300;
+        func.end = 0x3320;
+        func.isRecompiled = true;
+        func.isStub = false;
+
+        std::vector<Instruction> instructions{
+            makeNop(0x3300),
+            makeJalr(0x3304, 25, 31),
+            makeNop(0x3308),
+            makeNop(0x330C),
+            makeNop(0x3310),
+        };
+
+        CodeGenerator gen({}, {});
+        gen.setJalrIndirectFallback(false);
+        CodeGenerator::AnalysisResult analysis = gen.collectInternalBranchTargets(func, instructions);
+
+        t.IsTrue(analysis.indirectFallbackEntryPoints.empty(),
+                 "JALR alone should not promote fallback entries when the option is off");
+        t.IsTrue(analysis.resumeEntryPoints.contains(0x330Cu),
+                 "JALR return pc should still be a resume entry");
+        t.IsFalse(analysis.entryPoints.contains(0x3310u),
+                  "instructions after the return pc should not become labels");
+    });
+
     tc.Run("syscall marks the following instruction as a resume entry", [](TestCase &t) {
         // Shape of a real SDK syscall wrapper:
         //   addiu $v1, $zero, <num> ; syscall ; jr $ra ; <delay slot>

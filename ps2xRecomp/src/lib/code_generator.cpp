@@ -120,6 +120,11 @@ namespace ps2recomp
         m_relocationCallNames = callNames;
     }
 
+    void CodeGenerator::setJalrIndirectFallback(bool enabled)
+    {
+        m_jalrIndirectFallback = enabled;
+    }
+
     void CodeGenerator::setConfiguredJumpTables(const std::vector<JumpTable> &jumpTables)
     {
         m_configJumpTableTargetsByAddress.clear();
@@ -266,7 +271,7 @@ namespace ps2recomp
     CodeGenerator::AnalysisResult CodeGenerator::collectInternalBranchTargets(
         const Function &function, const std::vector<Instruction> &instructions, const std::vector<Function> *allFunctions)
     {
-        ControlFlowAnalyzer analyzer(m_sections, m_configJumpTableTargetsByAddress, m_reporter);
+        ControlFlowAnalyzer analyzer(m_sections, m_configJumpTableTargetsByAddress, m_reporter, m_jalrIndirectFallback);
         return analyzer.analyze(function, instructions, allFunctions);
     }
 

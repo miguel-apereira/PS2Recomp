@@ -12,10 +12,12 @@ namespace ps2recomp
     ControlFlowAnalyzer::ControlFlowAnalyzer(
         const std::vector<Section> &sections,
         const std::unordered_map<uint32_t, std::vector<uint32_t>> &configuredJumpTableTargetsByAddress,
-        RecompilerReporter *reporter)
+        RecompilerReporter *reporter,
+        bool jalrIndirectFallback)
         : m_sections(sections),
           m_configJumpTableTargetsByAddress(configuredJumpTableTargetsByAddress),
-          m_reporter(reporter)
+          m_reporter(reporter),
+          m_jalrIndirectFallback(jalrIndirectFallback)
     {
     }
 
@@ -190,6 +192,7 @@ namespace ps2recomp
         if (hasIndirectRegisterJump)
         {
             bool needsIndirectFallback = false;
+            std::vector<uint32_t> unresolvedJumpAddresses;
             for (const Instruction *jrInst : indirectJumps)
             {
                 if (jrInst->function == SPECIAL_JALR)
@@ -395,7 +398,13 @@ namespace ps2recomp
                 }
                 if (!foundTable)
                 {
-                    needsIndirectFallback = true;
+                    unresolvedJumpAddresses.push_back(jrInst->address);
+                    // A JALR returns to its own resume entry (address + 8), so
+                    // only an unresolved JR can land anywhere in this function.
+                    if (jrInst->function != SPECIAL_JALR || m_jalrIndirectFallback)
+                    {
+                        needsIndirectFallback = true;
+                    }
                 }
             }
 
@@ -403,13 +412,7 @@ namespace ps2recomp
             {
                 if (m_reporter)
                 {
-                    std::vector<uint32_t> jumpAddresses;
-                    jumpAddresses.reserve(indirectJumps.size());
-                    for (const Instruction *jrInst : indirectJumps)
-                    {
-                        jumpAddresses.push_back(jrInst->address);
-                    }
-                    m_reporter->recordIndirectFallbackPromotion(function.name, jumpAddresses, instructionAddresses.size());
+                    m_reporter->recordIndirectFallbackPromotion(function.name, unresolvedJumpAddresses, instructionAddresses.size());
                 }
 
                 for (uint32_t addr : instructionAddresses)
