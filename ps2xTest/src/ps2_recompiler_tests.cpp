@@ -1408,10 +1408,13 @@ void register_ps2_recompiler_tests()
             configFile << "output = \"out\"\n";
             configFile << "entry_points = [\"callback@0x7008\"]\n";
             configFile << "untracked_stubs = [\"legacy_callback@0x7018\"]\n";
+            configFile << "incremental_output = true\n";
             configFile.close();
 
             ConfigManager manager(configPath.string());
             const RecompilerConfig config = manager.loadConfig();
+
+            t.IsTrue(config.incrementalOutput, "incremental_output should load");
 
             t.Equals(config.entryPointHints.size(), static_cast<size_t>(2),
                      "modern and legacy entry metadata should be merged");

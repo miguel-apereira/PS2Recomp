@@ -1024,6 +1024,7 @@ namespace ps2recomp
             m_codeGenerator->setConfiguredJumpTables(m_config.jumpTables);
             m_codeGenerator->setJalrIndirectFallback(m_config.jalrIndirectFallback);
             m_codeGenerator->setEmitInstructionComments(true);
+            m_codeGenerator->setLocalFunctionDeclarations(m_config.incrementalOutput);
 
             fs::create_directories(m_config.outputPath);
 
@@ -1192,6 +1193,9 @@ namespace ps2recomp
         try
         {
             m_functionRenames.clear();
+            m_producedOutputFiles.clear();
+            m_writtenOutputFiles = 0;
+            m_unchangedOutputFiles = 0;
 
             auto makeName = [&](const Function &function) -> std::string
             {
@@ -1376,6 +1380,7 @@ namespace ps2recomp
             if (m_config.singleFileOutput)
             {
                 fs::path outputPath = fs::path(m_config.outputPath) / "ps2_recompiled_functions.cpp";
+                recordProducedOutputFile(outputPath);
                 std::ofstream combinedOutput(outputPath);
                 if (!combinedOutput)
                 {
@@ -1786,6 +1791,18 @@ namespace ps2recomp
             if (!generateStubHeader())
             {
                 throw std::runtime_error("Failed to generate stub header");
+            }
+
+            {
+                std::ostringstream msg;
+                msg << "output files: " << m_writtenOutputFiles << " written, "
+                    << m_unchangedOutputFiles << " unchanged";
+                m_reporter.progress(msg.str());
+            }
+
+            if (m_config.incrementalOutput)
+            {
+                removeStaleOutputFiles();
             }
         }
         catch (const std::exception &e)
@@ -2294,6 +2311,25 @@ namespace ps2recomp
 
     bool PS2Recompiler::writeToFile(const std::string &path, const std::string &content)
     {
+        recordProducedOutputFile(path);
+
+        // A file that already holds this content is left alone: rewriting it
+        // would only bump its timestamp and make the build recompile it.
+        // Text mode on both sides, so line endings compare the way they are written.
+        {
+            std::ifstream existing(path);
+            if (existing)
+            {
+                std::ostringstream current;
+                current << existing.rdbuf();
+                if (current.str() == content)
+                {
+                    ++m_unchangedOutputFiles;
+                    return true;
+                }
+            }
+        }
+
         std::ofstream file(path);
         if (!file)
         {
@@ -2303,8 +2339,70 @@ namespace ps2recomp
 
         file << content;
         file.close();
+        if (!file)
+        {
+            m_reporter.error("file", "Failed to write file: " + path);
+            return false;
+        }
 
+        ++m_writtenOutputFiles;
         return true;
+    }
+
+    namespace
+    {
+        std::string outputFileKey(const fs::path &path)
+        {
+            std::string key = fs::absolute(path).lexically_normal().generic_string();
+#ifdef _WIN32
+            // Windows paths are case-insensitive: a function renamed only in case
+            // reuses the existing file, which must not then look stale.
+            std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c)
+                           { return static_cast<char>(std::tolower(c)); });
+#endif
+            return key;
+        }
+    }
+
+    void PS2Recompiler::recordProducedOutputFile(const fs::path &path)
+    {
+        m_producedOutputFiles.insert(outputFileKey(path));
+    }
+
+    void PS2Recompiler::removeStaleOutputFiles()
+    {
+        // Only top-level .cpp/.h files: everything the recompiler writes lives
+        // there, and anything else in the folder is not ours to delete.
+        std::vector<fs::path> staleFiles;
+        for (const fs::directory_entry &entry : fs::directory_iterator(m_config.outputPath))
+        {
+            if (!entry.is_regular_file())
+            {
+                continue;
+            }
+
+            const fs::path extension = entry.path().extension();
+            if (extension != ".cpp" && extension != ".h")
+            {
+                continue;
+            }
+
+            if (!m_producedOutputFiles.contains(outputFileKey(entry.path())))
+            {
+                staleFiles.push_back(entry.path());
+            }
+        }
+
+        std::sort(staleFiles.begin(), staleFiles.end());
+        for (const fs::path &staleFile : staleFiles)
+        {
+            fs::remove(staleFile);
+            m_reporter.info("output", "removed stale output file " + staleFile.filename().string());
+        }
+
+        std::ostringstream msg;
+        msg << "removed " << staleFiles.size() << " stale output file(s)";
+        m_reporter.progress(msg.str());
     }
 
     std::filesystem::path PS2Recompiler::getOutputPath(const Function &function) const

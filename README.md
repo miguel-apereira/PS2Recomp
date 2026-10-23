@@ -91,6 +91,7 @@ Main fields in `config.toml`:
 * `general.ghidra_output`: recommended function map CSV exported from Ghidra.
 * `general.output`: generated C++ output folder.
 * `general.single_file_output`: one combined cpp or one file per function.
+* `general.incremental_output`: keep rebuilds small after recompiling. Each function file declares only the functions it calls instead of including `ps2_recompiled_functions.h` (which changes whenever any function is added or renamed), and `.cpp`/`.h` files in the output folder that this run did not produce are deleted, so do not keep your own sources there. Files whose content did not change are never rewritten, whether this is on or not, so their timestamps stay and the build skips them.
 * `general.low_memory_mode`: reduce peak output-generation memory by avoiding retained disassembly strings and forcing serial output generation. Generated instruction comments are still emitted; disassembly text is produced while writing each output file instead of being kept in memory.
 * `general.output_worker_threads`: number of output-generation workers (clamped to nproc * 2). A positive value uses exactly that many workers. `0` uses `nproc - 1` when at least two hardware threads are available, otherwise serial output generation. `1` forces serial output generation.
 * `general.patch_syscalls`: apply configured patches to `SYSCALL` instructions (`false` recommended).

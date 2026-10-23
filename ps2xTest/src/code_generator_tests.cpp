@@ -191,6 +191,47 @@ void register_code_generator_tests()
                  "the registration source must use the same unambiguous stub header");
     });
 
+    tc.Run("Local function declarations replace the shared declaration headers", [](TestCase &t) {
+        Function func;
+        func.name = "caller";
+        func.start = 0x4000;
+        func.end = 0x400C;
+        func.isRecompiled = true;
+
+        Symbol targetSym{};
+        targetSym.name = "callee";
+        targetSym.address = 0x5000;
+        targetSym.size = 4;
+        targetSym.isFunction = true;
+
+        Instruction j{};
+        j.address = 0x4000;
+        j.opcode = OPCODE_J;
+        j.target = (targetSym.address >> 2) & 0x3FFFFFF;
+        j.hasDelaySlot = true;
+        j.raw = 0x08000000 | (j.target & 0x3FFFFFF);
+
+        CodeGenerator gen({targetSym}, {});
+        gen.setLocalFunctionDeclarations(true);
+        const std::string generated = gen.generateFunction(func, {j, makeNop(0x4004), makeNop(0x4008)}, true);
+        printGeneratedCode("local function declarations", generated);
+
+        t.IsTrue(generated.find("#include <ps2_recompiled_functions.h>") == std::string::npos,
+                 "a function file must not depend on the header that lists every function");
+        t.IsTrue(generated.find("#include <ps2_recompiled_stubs.h>") == std::string::npos,
+                 "a function file must not depend on the header that lists every stub");
+        const size_t declaration = generated.find("void callee(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime);");
+        const size_t call = generated.find("callee(rdram, ctx, runtime); return;");
+        t.IsTrue(declaration != std::string::npos, "a called function must be declared in the file");
+        t.IsTrue(call != std::string::npos && declaration < call, "the declaration must come before the call");
+        t.IsTrue(generated.find("#include \"ps2_runtime.h\"") < declaration,
+                 "the runtime types must be included before the declarations use them");
+
+        const std::string leaf = gen.generateFunction(func, {makeNop(0x4000)}, true);
+        t.IsTrue(leaf.find("callee") == std::string::npos,
+                 "declarations from an earlier function must not leak into the next one");
+    });
+
     tc.Run("unsigned integer loads use explicit zero extension", [](TestCase &t) {
         CodeGenerator gen({}, {});
         const std::string lbu = gen.translateInstruction(makeIType(0x8F10, OPCODE_LBU, 1, 2, 0x10));

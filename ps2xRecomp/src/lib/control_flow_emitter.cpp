@@ -220,6 +220,7 @@ namespace ps2recomp
             return false;
         }
 
+        m_gen.m_referencedFunctionNames.insert(functionName);
         m_ss << indent << functionName << "(rdram, ctx, runtime); return;\n";
         return true;
     }

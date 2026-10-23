@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <set>
 #include <unordered_map>
 #include <unordered_set>
 #include "ps2recomp/control_flow_analyzer.h"
@@ -55,6 +56,7 @@ namespace ps2recomp
         void setJalrIndirectFallback(bool enabled);
         void setResumeEntryTargets(const std::unordered_map<uint32_t, std::vector<uint32_t>> &resumeTargetsByOwner);
         void setEmitInstructionComments(bool emitInstructionComments);
+        void setLocalFunctionDeclarations(bool enabled);
         void setReporter(RecompilerReporter *reporter);
 
         AnalysisResult collectInternalBranchTargets(const Function &function,
@@ -71,6 +73,12 @@ namespace ps2recomp
         const std::vector<Section>& m_sections;
         BootstrapInfo m_bootstrapInfo;
         bool m_emitInstructionComments = true;
+        // With headers on: declare each called function in the file itself
+        // instead of including ps2_recompiled_functions.h, so adding or
+        // renaming a function does not invalidate every generated file.
+        bool m_localFunctionDeclarations = false;
+        // Functions the function being generated calls by name.
+        std::set<std::string> m_referencedFunctionNames;
         RecompilerReporter *m_reporter = nullptr;
         std::string m_currentFunctionName;
 
