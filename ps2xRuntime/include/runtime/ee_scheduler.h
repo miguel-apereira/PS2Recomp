@@ -285,6 +285,8 @@ public:
     // Kernel object API. All calls except postEvent/requestStop execute on the
     // EE executor and therefore need no host synchronization.
     void setupCurrentThread(uint32_t stack, uint32_t stackSize, uint32_t gp);
+    // Lowest address of the current thread's stack, or 0 when it has none.
+    [[nodiscard]] uint32_t currentThreadStack();
     int createThread(const EeThreadCreateParams &params);
     int deleteThread(int id, uint32_t &ownedStack);
     int startThread(int id, uint32_t arg, const R5900Context &caller, bool interruptSafe);

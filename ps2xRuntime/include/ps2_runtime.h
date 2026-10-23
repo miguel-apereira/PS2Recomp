@@ -430,6 +430,14 @@ public:
     uint32_t guestHeapEnd() const;
     uint32_t guestHeapLimit() const;
     uint32_t reserveAsyncCallbackStack(uint32_t size, uint32_t alignment = 16u);
+    // The end of the game's heap as the EE kernel sees it (SetupHeap/EndOfHeap); 0 until SetupHeap.
+    void setKernelHeapEnd(uint32_t end);
+    uint32_t kernelHeapEnd() const;
+    // Moves the runtime's own guest memory (guestMalloc, used for its SIF and GS packets and
+    // the stacks it creates, and the stacks it runs handlers and callbacks on) into memory
+    // the game never touches, for games that keep their own malloc and claim the rest of RAM.
+    // Call after loadELF; SetupHeap then no longer moves the guest heap.
+    void reserveRuntimeGuestMemory(uint32_t heapBase, uint32_t heapLimit, uint32_t stackFloor, uint32_t stackTop);
 
     void drainCompletedDmacHandlers(uint8_t *rdram);
 
@@ -559,6 +567,8 @@ private:
     uint32_t m_guestHeapLimit = PS2_RAM_SIZE;
     uint32_t m_guestHeapSuggestedBase = 0x00100000u;
     bool m_guestHeapConfigured = false;
+    bool m_guestHeapReserved = false;
+    uint32_t m_kernelHeapEnd = 0u;
     uint32_t m_asyncCallbackStackFloor = 0x01F00000u;
     uint32_t m_asyncCallbackStackTop = PS2_RAM_SIZE;
 

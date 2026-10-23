@@ -422,6 +422,13 @@ void EeScheduler::setupCurrentThread(uint32_t stack, uint32_t stackSize, uint32_
     publishSnapshot();
 }
 
+uint32_t EeScheduler::currentThreadStack()
+{
+    assertExecutor();
+    const GuestThread *thread = currentThread();
+    return thread ? thread->stack : 0u;
+}
+
 int EeScheduler::createThread(const EeThreadCreateParams &params)
 {
     assertExecutor();

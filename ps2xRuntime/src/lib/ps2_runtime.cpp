@@ -504,6 +504,8 @@ PS2Runtime::PS2Runtime()
     m_guestHeapLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
     m_guestHeapSuggestedBase = kGuestHeapDefaultBase;
     m_guestHeapConfigured = false;
+    m_guestHeapReserved = false;
+    m_kernelHeapEnd = 0u;
     m_asyncCallbackStackFloor = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
     m_asyncCallbackStackTop = PS2_RAM_SIZE;
 }
@@ -1898,6 +1900,10 @@ void PS2Runtime::freeGuestBlockLocked(uint32_t guestAddr)
 void PS2Runtime::configureGuestHeap(uint32_t guestBase, uint32_t guestLimit)
 {
     std::lock_guard<std::mutex> lock(m_guestHeapMutex);
+    if (m_guestHeapReserved)
+    {
+        return;
+    }
     uint32_t normalizedBase = alignGuestHeapValue(clampGuestHeapBase(guestBase), kGuestHeapDefaultAlignment);
     if (normalizedBase == 0u)
     {
@@ -2064,6 +2070,31 @@ uint32_t PS2Runtime::guestHeapLimit() const
 {
     std::lock_guard<std::mutex> lock(m_guestHeapMutex);
     return m_guestHeapConfigured ? m_guestHeapLimit : m_guestHeapSuggestedBase;
+}
+
+void PS2Runtime::setKernelHeapEnd(uint32_t end)
+{
+    std::lock_guard<std::mutex> lock(m_guestHeapMutex);
+    m_kernelHeapEnd = end;
+}
+
+uint32_t PS2Runtime::kernelHeapEnd() const
+{
+    std::lock_guard<std::mutex> lock(m_guestHeapMutex);
+    return m_kernelHeapEnd;
+}
+
+void PS2Runtime::reserveRuntimeGuestMemory(uint32_t heapBase, uint32_t heapLimit, uint32_t stackFloor, uint32_t stackTop)
+{
+    {
+        std::lock_guard<std::mutex> lock(m_guestHeapMutex);
+        m_guestHeapReserved = false;
+        resetGuestHeapLocked(heapBase, heapLimit);
+        m_guestHeapReserved = true;
+    }
+    std::lock_guard<std::mutex> lock(m_asyncCallbackStackMutex);
+    m_asyncCallbackStackFloor = stackFloor;
+    m_asyncCallbackStackTop = stackTop;
 }
 
 uint32_t PS2Runtime::reserveAsyncCallbackStack(uint32_t size, uint32_t alignment)

@@ -559,6 +559,21 @@ namespace ps2_syscalls
 
         if (runtime)
         {
+            // The kernel ends a "rest of RAM" heap where the thread's stack
+            // begins, and EndOfHeap reports that. newlib's sbrk checks against
+            // it, and games such as The Getaway size their own heap up to just
+            // below their stack.
+            uint32_t kernelHeapEnd = heapLimit;
+            if (heapSize == 0u || heapSize == 0xFFFFFFFFu)
+            {
+                const uint32_t stack = runtime->eeScheduler().currentThreadStack();
+                if (stack > heapBase && stack <= PS2_RAM_SIZE)
+                {
+                    kernelHeapEnd = stack;
+                }
+            }
+            runtime->setKernelHeapEnd(kernelHeapEnd);
+
             runtime->configureGuestHeap(heapBase, heapLimit);
 
             PS2_IF_AGRESSIVE_LOGS({
@@ -578,16 +593,18 @@ namespace ps2_syscalls
         setReturnU32(ctx, heapBase);
     }
 
-    // 0x3E EndOfHeap: commonly returns current heap end; keep it stable for now.
+    // 0x3E EndOfHeap: the heap end SetupHeap set up.
     void EndOfHeap(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         (void)rdram;
 
         static constexpr uint32_t kDefaultGuestHeapEnd = 0x01F00000u;
 
-        const uint32_t ret = runtime
-                                 ? runtime->guestHeapLimit()
-                                 : kDefaultGuestHeapEnd;
+        uint32_t ret = kDefaultGuestHeapEnd;
+        if (runtime)
+        {
+            ret = runtime->kernelHeapEnd() != 0u ? runtime->kernelHeapEnd() : runtime->guestHeapLimit();
+        }
 
         setReturnU32(ctx, ret);
     }
