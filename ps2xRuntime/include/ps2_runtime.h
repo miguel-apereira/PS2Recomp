@@ -408,6 +408,10 @@ public:
     void SignalException(R5900Context *ctx, PS2Exception exception);
 
     void executeVU0Microprogram(uint8_t *rdram, R5900Context *ctx, uint32_t address);
+    // Runs VU0 microprograms (VCALLMS/VCALLMSR, and whatever else calls
+    // executeVU0Microprogram) on the host instead of the VU interpreter.
+    using Vu0MicroprogramHandler = std::function<void(uint8_t *rdram, R5900Context *ctx, uint32_t address)>;
+    void setVu0MicroprogramHandler(Vu0MicroprogramHandler handler) { m_vu0MicroprogramHandler = std::move(handler); }
     void vu0StartMicroProgram(uint8_t *rdram, R5900Context *ctx, uint32_t address);
 
 public:
@@ -552,6 +556,7 @@ private:
     PS2RomDevice m_romDevice;
     PS2Vfs m_vfs;
     VU1Interpreter m_vu0{VU1Interpreter::Unit::VU0};
+    Vu0MicroprogramHandler m_vu0MicroprogramHandler;
     VU1Interpreter m_vu1{VU1Interpreter::Unit::VU1};
     R5900Context m_cpuContext;
     std::unique_ptr<EeScheduler> m_eeScheduler;

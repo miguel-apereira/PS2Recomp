@@ -1518,6 +1518,12 @@ void PS2Runtime::SignalException(R5900Context *ctx, PS2Exception exception)
 
 void PS2Runtime::executeVU0Microprogram(uint8_t *rdram, R5900Context *ctx, uint32_t address)
 {
+    if (m_vu0MicroprogramHandler)
+    {
+        m_vu0MicroprogramHandler(rdram, ctx, address);
+        return;
+    }
+
     (void)rdram;
 
     uint8_t *const vu0Code = m_memory.getVU0Code();

@@ -2,6 +2,7 @@
 #define PS2_MEMORY_H
 
 #include "runtime/ps2_ipu.h"
+#include "runtime/ps2_vif0.h"
 #include <cstddef>
 #include <cstdint>
 #include <array>
@@ -320,6 +321,8 @@ public:
 
     // Routes the IPU registers, FIFOs and DMA channels 3/4 to a host IPU.
     void setIpuDevice(PS2IpuDevice *device) { m_ipu = device; }
+    // Routes the VIF0 registers, its FIFO and DMA channel 0 to a host VIF0.
+    void setVif0Device(PS2Vif0Device *device) { m_vif0 = device; }
     // Interrupts raised by devices since the last call, as cause bit masks
     // (INTC causes, DMAC channels). The EE scheduler dispatches them.
     uint32_t takePendingIntc() { return m_pendingIntc.exchange(0u, std::memory_order_acq_rel); }
@@ -414,6 +417,9 @@ public:
     std::atomic<uint32_t> m_pendingDmac{0};
 
     void serviceIpu();
+    PS2Vif0Device *m_vif0 = nullptr;
+    bool m_vif0ChainEnding = false;
+    void serviceVif0();
     Vu1MscalCallback m_vu1MscalCallback;
     Vu1MscntCallback m_vu1MscntCallback;
 
