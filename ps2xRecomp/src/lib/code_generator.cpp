@@ -166,6 +166,17 @@ namespace ps2recomp
         m_localFunctionDeclarations = enabled;
     }
 
+    std::string CodeGenerator::runtimeHandlerDeclaration(const std::string &qualifiedName)
+    {
+        const size_t separator = qualifiedName.rfind("::");
+        if (separator == std::string::npos)
+        {
+            return "void " + qualifiedName + "(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);\n";
+        }
+        return "namespace " + qualifiedName.substr(0, separator) + " { void " + qualifiedName.substr(separator + 2) +
+               "(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime); }\n";
+    }
+
     void CodeGenerator::setReporter(RecompilerReporter *reporter)
     {
         m_reporter = reporter;

@@ -57,6 +57,8 @@ namespace ps2recomp
         void setResumeEntryTargets(const std::unordered_map<uint32_t, std::vector<uint32_t>> &resumeTargetsByOwner);
         void setEmitInstructionComments(bool emitInstructionComments);
         void setLocalFunctionDeclarations(bool enabled);
+        // "ns::Name" -> "namespace ns { void Name(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime); }"
+        static std::string runtimeHandlerDeclaration(const std::string &qualifiedName);
         void setReporter(RecompilerReporter *reporter);
 
         AnalysisResult collectInternalBranchTargets(const Function &function,
@@ -79,6 +81,8 @@ namespace ps2recomp
         bool m_localFunctionDeclarations = false;
         // Functions the function being generated calls by name.
         std::set<std::string> m_referencedFunctionNames;
+        // Runtime handlers it calls, qualified ("ps2_syscalls::FlushCache").
+        std::set<std::string> m_referencedRuntimeHandlers;
         RecompilerReporter *m_reporter = nullptr;
         std::string m_currentFunctionName;
 

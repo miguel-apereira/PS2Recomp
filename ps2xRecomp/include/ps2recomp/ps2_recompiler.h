@@ -73,6 +73,8 @@ namespace ps2recomp
         std::unordered_set<uint32_t> m_entryPointHintStarts;
         std::unordered_set<uint32_t> m_correctnessCriticalFunctionStarts;
         std::map<uint32_t, std::string> m_generatedStubs;
+        // The runtime handler each generated stub calls ("ps2_syscalls::FlushCache"), if any.
+        std::map<uint32_t, std::string> m_generatedStubHandlers;
         std::unordered_map<uint32_t, std::string> m_functionRenames;
         std::unordered_map<uint32_t, std::vector<uint32_t>> m_resumeEntryTargetsByOwner;
         CodeGenerator::BootstrapInfo m_bootstrapInfo;

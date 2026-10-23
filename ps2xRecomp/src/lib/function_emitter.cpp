@@ -40,6 +40,7 @@ namespace ps2recomp
         std::stringstream ss;
         cg.m_currentFunctionName = function.name;
         cg.m_referencedFunctionNames.clear();
+        cg.m_referencedRuntimeHandlers.clear();
         const bool localDeclarations = useHeaders && cg.m_localFunctionDeclarations;
 
         if (useHeaders && !localDeclarations)
@@ -243,18 +244,23 @@ namespace ps2recomp
         }
 
         // The callees are only known once the body is written, so the
-        // includes and declarations go in front of it now.
+        // includes and declarations go in front of it now. Only the guest
+        // macros and the slim runtime interface (ps2_guest_abi.h) are
+        // included, never ps2_runtime.h, so runtime changes do not touch
+        // generated code.
         std::stringstream file;
         file << "#include <stdexcept>\n";
-        file << "#include \"ps2_runtime_macros.h\"\n";
-        file << "#include \"ps2_runtime.h\"\n";
-        file << "#include \"ps2_syscalls.h\"\n";
-        file << "#include \"ps2_stubs.h\"\n\n";
+        file << "#include \"ps2_guest_macros.h\"\n\n";
         file << "#ifdef PS2_FUNCTION_LOG_TRACKER\n";
         file << "#include \"ps2_log.h\"\n";
         file << "#endif\n\n";
 
         bool declaredAny = false;
+        for (const std::string &handler : cg.m_referencedRuntimeHandlers)
+        {
+            file << CodeGenerator::runtimeHandlerDeclaration(handler);
+            declaredAny = true;
+        }
         for (const std::string &callee : cg.m_referencedFunctionNames)
         {
             if (callee == sanitizedName)
