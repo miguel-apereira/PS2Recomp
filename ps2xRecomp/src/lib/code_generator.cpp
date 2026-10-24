@@ -161,6 +161,11 @@ namespace ps2recomp
         m_emitInstructionComments = emitInstructionComments;
     }
 
+    void CodeGenerator::setLocalFunctionDeclarations(bool enabled)
+    {
+        m_localFunctionDeclarations = enabled;
+    }
+
     void CodeGenerator::setReporter(RecompilerReporter *reporter)
     {
         m_reporter = reporter;

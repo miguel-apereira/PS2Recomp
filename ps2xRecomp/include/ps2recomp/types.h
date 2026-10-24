@@ -187,6 +187,11 @@ namespace ps2recomp
         // Promote every instruction of a function with an unresolved JALR to a
         // resumable entry. Off: only unresolved JR (non-$ra) jumps do that.
         bool jalrIndirectFallback = true;
+        // Keep unchanged output files untouched so a build only recompiles what
+        // changed: each function file declares just the functions it calls
+        // (instead of including the header that lists every function), and
+        // .cpp/.h files left over from an earlier run are deleted.
+        bool incrementalOutput = false;
         std::vector<std::string> skipFunctions;
         std::unordered_map<uint32_t, std::string> patches;
         std::vector<std::string> stubImplementations;

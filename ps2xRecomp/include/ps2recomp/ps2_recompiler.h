@@ -76,6 +76,9 @@ namespace ps2recomp
         std::unordered_map<uint32_t, std::string> m_functionRenames;
         std::unordered_map<uint32_t, std::vector<uint32_t>> m_resumeEntryTargetsByOwner;
         CodeGenerator::BootstrapInfo m_bootstrapInfo;
+        std::unordered_set<std::string> m_producedOutputFiles;
+        size_t m_writtenOutputFiles = 0;
+        size_t m_unchangedOutputFiles = 0;
 
         bool decodeFunction(Function &function);
         void discoverAdditionalEntryPoints();
@@ -87,6 +90,8 @@ namespace ps2recomp
         bool generateFunctionHeader();
         bool generateStubHeader();
         bool writeToFile(const std::string &path, const std::string &content);
+        void recordProducedOutputFile(const std::filesystem::path &path);
+        void removeStaleOutputFiles();
         std::filesystem::path getOutputPath(const Function &function) const;
         static std::string clampFilenameLength(const std::string& baseName, const std::string& extension, std::size_t maxLength);
         std::string sanitizeFunctionName(const std::string &name) const;       
