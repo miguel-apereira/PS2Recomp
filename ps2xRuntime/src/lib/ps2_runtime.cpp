@@ -1446,6 +1446,44 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     ctx->pc = targetPc;
     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
 
+    // Debugging aid: TGR_TRACE_CALLS="0x1ED878,0x1EDE48" logs calls to those
+    // guest functions (caller and a0-a3), up to 64 times each.
+    static const std::unordered_map<uint32_t, int> *traced = []
+    {
+        auto *targets = new std::unordered_map<uint32_t, int>();
+        if (const char *list = std::getenv("TGR_TRACE_CALLS"))
+        {
+            for (const char *cursor = list; *cursor;)
+            {
+                char *end = nullptr;
+                const unsigned long value = std::strtoul(cursor, &end, 0);
+                if (end == cursor)
+                    break;
+                (*targets)[static_cast<uint32_t>(value)] = 0;
+                cursor = (*end == ',') ? end + 1 : end;
+            }
+        }
+        return targets;
+    }();
+    static const auto traceStart = std::chrono::steady_clock::now();
+    static const long long traceAfterMs = []
+    {
+        const char *after = std::getenv("TGR_TRACE_AFTER_MS");
+        return after ? std::atoll(after) : 0LL;
+    }();
+    if (isCall && !traced->empty() &&
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - traceStart).count() >=
+            traceAfterMs)
+    {
+        auto it = const_cast<std::unordered_map<uint32_t, int> *>(traced)->find(targetPc);
+        if (it != traced->end() && it->second++ < 64)
+        {
+            std::cerr << "[call] 0x" << std::hex << targetPc << " from 0x" << sourcePc << " a0=0x" << GPR_U32(ctx, 4)
+                      << " a1=0x" << GPR_U32(ctx, 5) << " a2=0x" << GPR_U32(ctx, 6) << " a3=0x" << GPR_U32(ctx, 7)
+                      << std::dec << std::endl;
+        }
+    }
+
     // Every inter-function transfer is also a deterministic EE safe point.
     // Backward edges inside generated functions use eeCheckpointDue(), while
     // this charge bounds straight-line call chains that have no local loop.
