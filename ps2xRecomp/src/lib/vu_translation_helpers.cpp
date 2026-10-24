@@ -157,7 +157,7 @@ namespace ps2recomp
         return fmt::format(
             "{{ "
             "    ctx->vu0_tpc = 0x{:X}; " // Set target program counter
-            "    runtime->executeVU0Microprogram(rdram, ctx, 0x{:X}); "
+            "    ps2_guest::executeVU0Microprogram(runtime, rdram, ctx, 0x{:X}); "
             "}}",
             target_byte_addr, target_byte_addr);
     }
@@ -172,7 +172,7 @@ namespace ps2recomp
             "    uint16_t instr_index = ctx->vi[{}] & 0x1FF; "             // Get instruction index from VI[IS], mask to 9 bits
             "    uint32_t target_byte_addr = (uint32_t)instr_index << 3; " // Convert to byte address
             "    ctx->vu0_pc = target_byte_addr; "
-            "    runtime->vu0StartMicroProgram(rdram, ctx, target_byte_addr); "
+            "    ps2_guest::vu0StartMicroProgram(runtime, rdram, ctx, target_byte_addr); "
             "}}",
             vis_reg_idx);
     }

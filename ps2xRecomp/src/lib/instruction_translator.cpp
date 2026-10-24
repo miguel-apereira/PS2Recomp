@@ -84,14 +84,14 @@ namespace ps2recomp
             const std::string resolvedAddressExpr = addressLiteral(resolvedAddress);
             if (inst.isMmio || Ps2IsSpecialAddress(resolvedAddress))
             {
-                return fmt::format("runtime->Load{}(rdram, ctx, {})", width, resolvedAddressExpr);
+                return fmt::format("ps2_guest::Load{}(runtime, rdram, ctx, {})", width, resolvedAddressExpr);
             }
             return fmt::format("FAST_READ{}({})", width, resolvedAddressExpr);
         }
 
         if (inst.isMmio)
         {
-            return fmt::format("runtime->Load{}(rdram, ctx, {})", width, addr);
+            return fmt::format("ps2_guest::Load{}(runtime, rdram, ctx, {})", width, addr);
         }
         return fmt::format("READ{}({})", width, addr);
     }
@@ -108,14 +108,14 @@ namespace ps2recomp
             const std::string resolvedAddressExpr = addressLiteral(resolvedAddress);
             if (inst.isMmio || Ps2IsSpecialAddress(resolvedAddress))
             {
-                return fmt::format("runtime->Store{}(rdram, ctx, {}, {})", width, resolvedAddressExpr, value);
+                return fmt::format("ps2_guest::Store{}(runtime, rdram, ctx, {}, {})", width, resolvedAddressExpr, value);
             }
             return genFastWrite(width, resolvedAddress, value);
         }
 
         if (inst.isMmio)
         {
-            return fmt::format("runtime->Store{}(rdram, ctx, {}, {})", width, addr, value);
+            return fmt::format("ps2_guest::Store{}(runtime, rdram, ctx, {}, {})", width, addr, value);
         }
         return fmt::format("WRITE{}({}, {})", width, addr, value);
     }
@@ -157,7 +157,7 @@ namespace ps2recomp
             return fmt::format(
                 "{{ uint32_t tmp; bool ov; "
                 "ADD32_OV(GPR_U32(ctx, {}), (int32_t){}, tmp, ov); "
-                "if (ov) runtime->SignalException(ctx, EXCEPTION_INTEGER_OVERFLOW); "
+                "if (ov) ps2_guest::SignalException(runtime, ctx, EXCEPTION_INTEGER_OVERFLOW); "
                 "else SET_GPR_S32(ctx, {}, (int32_t)tmp); }}",
                 inst.rs, inst.simmediate, inst.rt);
 
@@ -220,7 +220,7 @@ namespace ps2recomp
                 "int64_t imm = (int64_t)(int32_t){}; "
                 "int64_t res = src + imm; "
                 "if (((src ^ imm) >= 0) && ((src ^ res) < 0)) "
-                "    runtime->SignalException(ctx, EXCEPTION_INTEGER_OVERFLOW); "
+                "    ps2_guest::SignalException(runtime, ctx, EXCEPTION_INTEGER_OVERFLOW); "
                 "else SET_GPR_S64(ctx, {}, res); }}",
                 inst.rs, inst.simmediate, inst.rt);
         case OPCODE_DADDIU:

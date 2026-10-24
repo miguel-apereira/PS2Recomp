@@ -1257,6 +1257,7 @@ namespace ps2recomp
             }
 
             m_generatedStubs.clear();
+            m_generatedStubHandlers.clear();
             for (const auto &function : m_functions)
             {
                 if (function.isStub || function.isSkipped)
@@ -1290,10 +1291,12 @@ namespace ps2recomp
                         if (!resolvedSyscallName.empty())
                         {
                             stub << "ps2_syscalls::" << resolvedSyscallName << "(rdram, ctx, runtime); ";
+                            m_generatedStubHandlers[function.start] = "ps2_syscalls::" + std::string(resolvedSyscallName);
                         }
                         else if (!resolvedStubName.empty())
                         {
                             stub << "ps2_stubs::" << resolvedStubName << "(rdram, ctx, runtime); ";
+                            m_generatedStubHandlers[function.start] = "ps2_stubs::" + std::string(resolvedStubName);
                         }
                         else
                         {
@@ -1338,6 +1341,7 @@ namespace ps2recomp
             }
 
             const auto &generatedStubs = m_generatedStubs;
+            const auto &generatedStubHandlers = m_generatedStubHandlers;
             const auto &decodedFunctions = m_decodedFunctions;
 
             auto generateFunctionCode = [&](CodeGenerator &codeGenerator, const Function &function, bool useHeaders) -> std::string
@@ -1352,13 +1356,29 @@ namespace ps2recomp
                         }
 
                         std::stringstream stubFile;
-                        stubFile << "#include \"ps2_runtime.h\"\n";
-                        stubFile << "#include \"ps2_syscalls.h\"\n";
-                        stubFile << "#include \"ps2_stubs.h\"\n";
+                        if (m_config.incrementalOutput)
+                        {
+                            // Only the slim runtime interface: see function_emitter.cpp.
+                            stubFile << "#include \"ps2_guest_abi.h\"\n";
+                        }
+                        else
+                        {
+                            stubFile << "#include \"ps2_runtime.h\"\n";
+                            stubFile << "#include \"ps2_syscalls.h\"\n";
+                            stubFile << "#include \"ps2_stubs.h\"\n";
+                        }
                         stubFile << "#ifdef _DEBUG\n";
                         stubFile << "#include \"ps2_log.h\"\n";
                         stubFile << "#endif\n";
                         stubFile << "\n";
+                        if (m_config.incrementalOutput)
+                        {
+                            const auto handlerIt = generatedStubHandlers.find(function.start);
+                            if (handlerIt != generatedStubHandlers.end())
+                            {
+                                stubFile << CodeGenerator::runtimeHandlerDeclaration(handlerIt->second) << "\n";
+                            }
+                        }
                         stubFile << generatedStubs.at(function.start) << "\n";
                         return stubFile.str();
                     }
