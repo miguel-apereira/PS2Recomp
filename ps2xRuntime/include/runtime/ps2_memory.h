@@ -2,7 +2,7 @@
 #define PS2_MEMORY_H
 
 #include "runtime/ps2_ipu.h"
-#include "runtime/ps2_vif0.h"
+#include "runtime/ps2_vif.h"
 #include <cstddef>
 #include <cstdint>
 #include <array>
@@ -321,8 +321,9 @@ public:
 
     // Routes the IPU registers, FIFOs and DMA channels 3/4 to a host IPU.
     void setIpuDevice(PS2IpuDevice *device) { m_ipu = device; }
-    // Routes the VIF0 registers, its FIFO and DMA channel 0 to a host VIF0.
-    void setVif0Device(PS2Vif0Device *device) { m_vif0 = device; }
+    // Routes a VIF's registers, its FIFO and its DMA channel to a host VIF.
+    void setVif0Device(PS2VifDevice *device) { m_vif[0] = device; }
+    void setVif1Device(PS2VifDevice *device) { m_vif[1] = device; }
     // Interrupts raised by devices since the last call, as cause bit masks
     // (INTC causes, DMAC channels). The EE scheduler dispatches them.
     uint32_t takePendingIntc() { return m_pendingIntc.exchange(0u, std::memory_order_acq_rel); }
@@ -343,6 +344,8 @@ public:
     const uint8_t *getVU0Data() const { return m_vu0Data; }
 
     bool isPath3Masked() const { return m_path3Masked; }
+    // MSKPATH3: while masked, PATH3 packets wait; unmasking sends them.
+    void setPath3Masked(bool masked);
     void flushMaskedPath3Packets(bool drainImmediately = true);
 
     void submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool drainImmediately = true, bool path2DirectHl = false);
@@ -417,9 +420,9 @@ public:
     std::atomic<uint32_t> m_pendingDmac{0};
 
     void serviceIpu();
-    PS2Vif0Device *m_vif0 = nullptr;
-    bool m_vif0ChainEnding = false;
-    void serviceVif0();
+    PS2VifDevice *m_vif[2] = {};
+    bool m_vifChainEnding[2] = {};
+    void serviceVif(int unit);
     Vu1MscalCallback m_vu1MscalCallback;
     Vu1MscntCallback m_vu1MscntCallback;
 

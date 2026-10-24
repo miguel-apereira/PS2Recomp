@@ -1080,12 +1080,12 @@ void PS2Memory::write128(uint32_t address, __m128i value)
     {
         alignas(16) uint8_t fifoData[16];
         _mm_storeu_si128(reinterpret_cast<__m128i *>(fifoData), value);
-        if (m_vif0)
+        if (m_vif[0])
         {
             uint32_t words[4];
             std::memcpy(words, fifoData, sizeof(words));
-            m_vif0->pushData(words, 4u);
-            serviceVif0();
+            m_vif[0]->pushData(words, 4u);
+            serviceVif(0);
             return;
         }
         processVIF0Data(fifoData, sizeof(fifoData));
@@ -1095,6 +1095,14 @@ void PS2Memory::write128(uint32_t address, __m128i value)
     {
         alignas(16) uint8_t fifoData[16];
         _mm_storeu_si128(reinterpret_cast<__m128i *>(fifoData), value);
+        if (m_vif[1])
+        {
+            uint32_t words[4];
+            std::memcpy(words, fifoData, sizeof(words));
+            m_vif[1]->pushData(words, 4u);
+            serviceVif(1);
+            return;
+        }
         processVIF1Data(fifoData, sizeof(fifoData));
         return;
     }
@@ -1253,6 +1261,14 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
     m_ioRegisters[address] = value;
 
+    if (m_vif[1] && address >= 0x10003C00u && address < 0x10003E00u)
+    {
+        m_vifWriteCount.fetch_add(1, std::memory_order_relaxed);
+        m_vif[1]->writeRegister(address - 0x10003C00u, value);
+        serviceVif(1);
+        return true;
+    }
+
     if (address >= 0x10003C00u && address < 0x10003E00u)
     {
         m_vifWriteCount.fetch_add(1, std::memory_order_relaxed);
@@ -1322,10 +1338,10 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
     if (address >= 0x10003800u && address < 0x10003A00u)
     {
         m_vifWriteCount.fetch_add(1, std::memory_order_relaxed);
-        if (m_vif0)
+        if (m_vif[0])
         {
-            m_vif0->writeRegister(address - 0x10003800u, value);
-            serviceVif0();
+            m_vif[0]->writeRegister(address - 0x10003800u, value);
+            serviceVif(0);
         }
         return true;
     }
@@ -1352,9 +1368,14 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                 return true;
             }
 
-            if (m_vif0 && channelBase == 0x10008000u)
+            if (m_vif[0] && channelBase == 0x10008000u)
             {
-                serviceVif0();
+                serviceVif(0);
+                return true;
+            }
+            if (m_vif[1] && channelBase == 0x10009000u)
+            {
+                serviceVif(1);
                 return true;
             }
 
@@ -2332,9 +2353,13 @@ int PS2Memory::pollDmaRegisters()
 
 uint32_t PS2Memory::readIORegister(uint32_t address)
 {
-    if (m_vif0 && address >= 0x10003800u && address < 0x10003A00u)
+    if (m_vif[0] && address >= 0x10003800u && address < 0x10003A00u)
     {
-        return m_vif0->readRegister(address - 0x10003800u);
+        return m_vif[0]->readRegister(address - 0x10003800u);
+    }
+    if (m_vif[1] && address >= 0x10003C00u && address < 0x10003E00u)
+    {
+        return m_vif[1]->readRegister(address - 0x10003C00u);
     }
 
     if (m_ipu)
@@ -2436,8 +2461,8 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
         {
             if ((address & 0xFF) == 0x00)
             {
-                // A host VIF0 runs channel 0 itself; STR stays set while VIF0 stalls.
-                if (m_vif0 && address == 0x10008000u)
+                // A host VIF runs its channel itself; STR stays set while the VIF stalls.
+                if ((m_vif[0] && address == 0x10008000u) || (m_vif[1] && address == 0x10009000u))
                 {
                     return m_ioRegisters[address];
                 }
@@ -2706,25 +2731,29 @@ void PS2Memory::serviceIpu()
     }
 }
 
-// DMA channel 0 (to VIF0), normal and source-chain mode. The channel feeds
-// VIF0 tag by tag and pauses while VIF0 stalls, so data the CPU writes
-// between stalls is read when it is sent, as on the hardware. It finishes
-// (CHCR.STR cleared, D_STAT.CIS set, DMAC interrupt raised) after an end or
-// refe tag, a ret with an empty address stack, a tag IRQ with CHCR.TIE, or in
-// normal mode once QWC reaches zero.
-void PS2Memory::serviceVif0()
+// DMA channel 0 (to VIF0) or 1 (to VIF1), normal and source-chain mode. The
+// channel feeds the VIF tag by tag and pauses while the VIF stalls, so data
+// the CPU writes between stalls is read when it is sent, as on the hardware.
+// It finishes (CHCR.STR cleared, D_STAT.CIS set, DMAC interrupt raised) after
+// an end or refe tag, a ret with an empty address stack, a tag IRQ with
+// CHCR.TIE, or in normal mode once QWC reaches zero. VIF1 transfers from the
+// VIF to memory (CHCR.DIR = 0, GS downloads) finish at once.
+void PS2Memory::serviceVif(int unit)
 {
-    if (!m_vif0)
+    PS2VifDevice *const vif = m_vif[unit];
+    if (!vif)
     {
         return;
     }
 
-    constexpr uint32_t kChcr = 0x10008000u;
-    constexpr uint32_t kMadr = 0x10008010u;
-    constexpr uint32_t kQwc = 0x10008020u;
-    constexpr uint32_t kTadr = 0x10008030u;
-    constexpr uint32_t kAsr0 = 0x10008040u;
-    constexpr uint32_t kAsr1 = 0x10008050u;
+    const uint32_t base = unit == 0 ? 0x10008000u : 0x10009000u;
+    const uint32_t kChcr = base;
+    const uint32_t kMadr = base + 0x10u;
+    const uint32_t kQwc = base + 0x20u;
+    const uint32_t kTadr = base + 0x30u;
+    const uint32_t kAsr0 = base + 0x40u;
+    const uint32_t kAsr1 = base + 0x50u;
+    bool &chainEnding = m_vifChainEnding[unit];
 
     // DMA addresses: bit 31 selects the scratchpad.
     const auto guestPointer = [this](uint32_t address) -> const uint8_t *
@@ -2736,19 +2765,19 @@ void PS2Memory::serviceVif0()
         const uint32_t physical = address & 0x01FFFFF0u;
         return physical < PS2_RAM_SIZE ? m_rdram + physical : nullptr;
     };
-    const auto finish = [this]()
+    const auto finish = [&]()
     {
         m_ioRegisters[kChcr] &= ~0x100u;
-        m_ioRegisters[0x1000E010u] |= 1u;
-        m_pendingDmac.fetch_or(1u, std::memory_order_acq_rel);
-        m_vif0ChainEnding = false;
+        m_ioRegisters[0x1000E010u] |= 1u << unit;
+        m_pendingDmac.fetch_or(1u << unit, std::memory_order_acq_rel);
+        chainEnding = false;
     };
-    // Sends QWC quadwords from MADR, as far as VIF0 takes them.
+    // Sends QWC quadwords from MADR, as far as the VIF takes them.
     const auto sendData = [&]() -> bool
     {
         while ((m_ioRegisters[kQwc] & 0xFFFFu) != 0u)
         {
-            if (m_vif0->stalled())
+            if (vif->stalled())
             {
                 return false;
             }
@@ -2758,12 +2787,17 @@ void PS2Memory::serviceVif0()
             {
                 std::memcpy(words, source, sizeof(words));
             }
-            m_vif0->pushData(words, 4u);
+            vif->pushData(words, 4u);
             m_ioRegisters[kMadr] = madr + 16u;
             m_ioRegisters[kQwc] = (m_ioRegisters[kQwc] & 0xFFFFu) - 1u;
         }
         return true;
     };
+
+    if (unit == 1 && (m_ioRegisters[kChcr] & 0x101u) == 0x100u)
+    {
+        finish(); // VIF1 to memory: nothing to download from the GS here
+    }
 
     for (int tags = 0; (m_ioRegisters[kChcr] & 0x100u) != 0u && tags < 65536; ++tags)
     {
@@ -2779,12 +2813,12 @@ void PS2Memory::serviceVif0()
 
         const uint32_t chcr = m_ioRegisters[kChcr];
         const uint32_t mode = (chcr >> 2) & 0x3u;
-        if (mode != 1u || m_vif0ChainEnding)
+        if (mode != 1u || chainEnding)
         {
             finish();
             break;
         }
-        if (m_vif0->stalled())
+        if (vif->stalled())
         {
             break;
         }
@@ -2801,9 +2835,9 @@ void PS2Memory::serviceVif0()
         const bool irq = (tag[0] & 0x80000000u) != 0u;
         const uint32_t addr = tag[1] & 0xFFFFFFF0u;
         m_ioRegisters[kChcr] = (chcr & 0xFFFFu) | (tag[0] & 0xFFFF0000u);
-        if ((chcr & 0x40u) != 0u) // TTE: the tag's upper half goes to VIF0 first
+        if ((chcr & 0x40u) != 0u) // TTE: the tag's upper half goes to the VIF first
         {
-            m_vif0->pushData(&tag[2], 2u);
+            vif->pushData(&tag[2], 2u);
         }
         m_ioRegisters[kQwc] = qwc;
 
@@ -2856,11 +2890,19 @@ void PS2Memory::serviceVif0()
         {
             end = true;
         }
-        m_vif0ChainEnding = end;
+        chainEnding = end;
     }
 
-    if (m_vif0->takeInterrupt())
+    if (vif->takeInterrupt())
     {
-        m_pendingIntc.fetch_or(1u << 4, std::memory_order_acq_rel);
+        m_pendingIntc.fetch_or(1u << (4 + unit), std::memory_order_acq_rel);
     }
+}
+
+void PS2Memory::setPath3Masked(bool masked)
+{
+    const bool wasMasked = m_path3Masked;
+    m_path3Masked = masked;
+    if (wasMasked && !masked)
+        flushMaskedPath3Packets();
 }
