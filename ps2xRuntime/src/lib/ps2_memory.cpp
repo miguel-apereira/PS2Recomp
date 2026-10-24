@@ -2729,7 +2729,7 @@ void PS2Memory::serviceVif0()
     // DMA addresses: bit 31 selects the scratchpad.
     const auto guestPointer = [this](uint32_t address) -> const uint8_t *
     {
-        if ((address & 0x80000000u) != 0u)
+        if ((address & 0x80000000u) != 0u || isScratchpad(address))
         {
             return m_scratchpad + (address & (PS2_SCRATCHPAD_SIZE - 16u));
         }

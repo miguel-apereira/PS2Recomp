@@ -1247,6 +1247,11 @@ namespace
             {
                 return lower;
             }
+            // DMA addresses with bit 31 set are scratchpad offsets (SPR bit).
+            if (lower < PS2_SCRATCHPAD_SIZE)
+            {
+                return PS2_SCRATCHPAD_BASE | lower;
+            }
         }
         return addr & 0x1FFFFFFFu;
     }
