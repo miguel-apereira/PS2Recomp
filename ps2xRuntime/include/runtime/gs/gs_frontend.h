@@ -10,6 +10,8 @@
 
 #include "runtime/gs/gs_backend.h"
 
+class PS2GsHost;
+
 struct GSDebugSnapshot
 {
     GSContext ctx[2]{};
@@ -105,6 +107,14 @@ public:
     void init(uint8_t *vram, uint32_t vramSize, struct GSRegisters *privRegs = nullptr);
     void reset();
     void setRasterBackend(std::unique_ptr<GSRasterBackend> backend);
+
+    // Installs a host that sees everything reaching the GS first and may take
+    // it over (see PS2GsHost). nullptr removes it.
+    void setHost(PS2GsHost *host) { m_host = host; }
+    PS2GsHost *host() const { return m_host; }
+
+    // Called by the EE scheduler at the start of each vertical blank.
+    void vsync(uint64_t tick);
 
     void processGIFPacket(const uint8_t *data, uint32_t sizeBytes);
     bool processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes);
@@ -242,6 +252,7 @@ private:
     bool m_debugHistoryPaused = true;
 
     std::unique_ptr<GSRasterBackend> m_backend;
+    PS2GsHost *m_host = nullptr;
 };
 
 #endif

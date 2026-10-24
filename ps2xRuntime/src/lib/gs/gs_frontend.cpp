@@ -1,5 +1,6 @@
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/gs_cpu_backend.h"
+#include "runtime/gs/ps2_gs_host.h"
 #include "ps2_log.h"
 #include "runtime/ps2_memory.h"
 #include <atomic>
@@ -643,6 +644,8 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     if (!data || sizeBytes < 16 || !m_backend)
         return;
+    if (m_host && m_host->gifPacket(data, sizeBytes))
+        return;
 
     if (tryProcessNativeImageUploadPacket(data, sizeBytes))
         return;
@@ -744,6 +747,8 @@ bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 
     if (!validatePackedGifPacket(data, sizeBytes))
         return false;
+    if (m_host && m_host->gifPacket(data, sizeBytes))
+        return true;
 
     const bool processed = visitPackedGifPacket(data, sizeBytes, [&](const PackedGifPacketTag &tag)
                                                 {
@@ -784,6 +789,8 @@ void GS::uploadImageNative(uint64_t bitbltbuf,
                            uint32_t sizeBytes)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    if (m_host && data && sizeBytes != 0 && m_host->imageUpload(bitbltbuf, trxpos, trxreg, trxdir, data, sizeBytes))
+        return;
     uploadImageNativeUnlocked(bitbltbuf, trxpos, trxreg, trxdir, data, sizeBytes);
 }
 
@@ -1062,6 +1069,8 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
 void GS::writeRegister(uint8_t regAddr, uint64_t value)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    if (m_host && m_host->registerWrite(regAddr, value))
+        return;
     writeRegisterUnlocked(regAddr, value);
 }
 
@@ -1617,19 +1626,32 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
 bool GS::clearFramebufferContext(uint32_t contextIndex, uint32_t rgba)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    if (m_host && m_host->clearFrame((contextIndex != 0u) ? 1u : 0u, rgba))
+        return true;
     return m_backend && m_backend->ClearFramebuffer(m_ctx[(contextIndex != 0u) ? 1 : 0], rgba);
 }
 
 bool GS::clearActiveFramebuffer(uint32_t rgba)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    if (m_host && m_host->clearFrame(m_prim.ctxt ? 1u : 0u, rgba))
+        return true;
     return m_backend && m_backend->ClearFramebuffer(activeContext(), rgba);
 }
 
 uint32_t GS::consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    uint32_t bytesRead = 0u;
+    if (m_host && m_host->localToHost(dst, maxBytes, bytesRead))
+        return bytesRead;
     return m_backend ? m_backend->ConsumeLocalToHostBytes(dst, maxBytes) : 0u;
+}
+
+void GS::vsync(uint64_t tick)
+{
+    if (m_host)
+        m_host->vsync(tick);
 }
 
 void GS::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)
