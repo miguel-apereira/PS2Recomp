@@ -156,10 +156,6 @@ public:
     using GifPacketCallback = std::function<void(const uint8_t *, uint32_t)>;
     void setGifPacketCallback(GifPacketCallback cb) { m_gifPacketCallback = std::move(cb); }
     void setGifArbiter(GifArbiter *arbiter) { m_gifArbiter = arbiter; }
-    // Reads up to size bytes of a GS local-to-host transfer into dst and
-    // returns how many it read. VIF1 DMA to memory (CHCR.DIR = 0) uses it.
-    using GsDownloadCallback = std::function<uint32_t(uint8_t *dst, uint32_t size)>;
-    void setGsDownloadCallback(GsDownloadCallback cb) { m_gsDownloadCallback = std::move(cb); }
 
     // Routes the IPU registers, FIFOs and DMA channels 3/4 to a host IPU.
     void setIpuDevice(PS2IpuDevice *device) { m_ipu = device; }
@@ -255,7 +251,6 @@ public:
 
     GifPacketCallback m_gifPacketCallback;
     GifArbiter *m_gifArbiter = nullptr;
-    GsDownloadCallback m_gsDownloadCallback;
     PS2IpuDevice *m_ipu = nullptr;
     uint32_t m_ipuInWords[4] = {};
     uint32_t m_ipuOutWords[4] = {};

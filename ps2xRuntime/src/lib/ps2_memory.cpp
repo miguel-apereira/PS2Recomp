@@ -2737,8 +2737,7 @@ void PS2Memory::serviceIpu()
 // It finishes (CHCR.STR cleared, D_STAT.CIS set, DMAC interrupt raised) after
 // an end or refe tag, a ret with an empty address stack, a tag IRQ with
 // CHCR.TIE, or in normal mode once QWC reaches zero. VIF1 transfers from the
-// VIF to memory (CHCR.DIR = 0, GS downloads) copy QWC quadwords of the GS's
-// local-to-host transfer to MADR at once (zeros once it has no more).
+// VIF to memory (CHCR.DIR = 0, GS downloads) finish at once.
 void PS2Memory::serviceVif(int unit)
 {
     PS2VifDevice *const vif = m_vif[unit];
@@ -2757,7 +2756,7 @@ void PS2Memory::serviceVif(int unit)
     bool &chainEnding = m_vifChainEnding[unit];
 
     // DMA addresses: bit 31 selects the scratchpad.
-    const auto guestPointer = [this](uint32_t address) -> uint8_t *
+    const auto guestPointer = [this](uint32_t address) -> const uint8_t *
     {
         if ((address & 0x80000000u) != 0u || isScratchpad(address))
         {
@@ -2797,22 +2796,7 @@ void PS2Memory::serviceVif(int unit)
 
     if (unit == 1 && (m_ioRegisters[kChcr] & 0x101u) == 0x100u)
     {
-        const uint32_t qwc = m_ioRegisters[kQwc] & 0xFFFFu;
-        std::vector<uint8_t> data(static_cast<size_t>(qwc) * 16u, 0u);
-        if (m_gsDownloadCallback && !data.empty())
-        {
-            m_gsDownloadCallback(data.data(), static_cast<uint32_t>(data.size()));
-        }
-        for (uint32_t i = 0; i < qwc; ++i)
-        {
-            if (uint8_t *target = guestPointer(m_ioRegisters[kMadr]))
-            {
-                std::memcpy(target, data.data() + static_cast<size_t>(i) * 16u, 16u);
-            }
-            m_ioRegisters[kMadr] += 16u;
-        }
-        m_ioRegisters[kQwc] &= ~0xFFFFu;
-        finish();
+        finish(); // VIF1 to memory: nothing to download from the GS here
     }
 
     for (int tags = 0; (m_ioRegisters[kChcr] & 0x100u) != 0u && tags < 65536; ++tags)
