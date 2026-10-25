@@ -281,6 +281,8 @@ public:
     [[nodiscard]] bool checkpointDue(uint32_t cycles = kGeneratedCheckpointCycles) noexcept;
     void accountCycles(uint32_t cycles) noexcept;
     [[nodiscard]] bool isExecutingGuest() const noexcept;
+    // EE cycles accounted so far (COP0 Count runs from these).
+    [[nodiscard]] uint64_t eeCycle() const noexcept { return m_eeCycle; }
 
     // Kernel object API. All calls except postEvent/requestStop execute on the
     // EE executor and therefore need no host synchronization.

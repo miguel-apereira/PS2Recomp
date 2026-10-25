@@ -160,6 +160,16 @@ void register_ps2_float_semantics_tests()
             t.Equals(bitsOf(FPU_DIV_S(6.0f, 3.0f)), bitsOf(2.0f), "ordinary division should be unchanged");
         });
 
+        tc.Run("PEXEW swaps words 0 and 2, PROT3W rotates words 0-2", [](TestCase &t)
+        {
+            alignas(16) uint32_t out[4];
+            const __m128i in = _mm_setr_epi32(10, 11, 12, 13);
+            _mm_store_si128(reinterpret_cast<__m128i *>(out), PS2_PEXEW(in));
+            t.IsTrue(out[0] == 12 && out[1] == 11 && out[2] == 10 && out[3] == 13, "PEXEW: w0 <- w2, w2 <- w0");
+            _mm_store_si128(reinterpret_cast<__m128i *>(out), PS2_PROT3W(in));
+            t.IsTrue(out[0] == 11 && out[1] == 12 && out[2] == 10 && out[3] == 13, "PROT3W: w0 <- w1, w1 <- w2, w2 <- w0");
+        });
+
         tc.Run("FPU RSQRT.S computes fs / sqrt(|ft|) and takes the sign of fs alone on a zero ft", [](TestCase &t)
         {
             t.Equals(bitsOf(FPU_RSQRT_S(4.0f, 16.0f)), bitsOf(1.0f), "4 / sqrt(16) should be 1");

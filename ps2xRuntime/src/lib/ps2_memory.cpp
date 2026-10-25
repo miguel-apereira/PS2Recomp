@@ -1410,10 +1410,17 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
             if ((channelBase == 0x1000A000u || channelBase == 0x10009000u || channelBase == 0x10008000u) && (m_gsVRAM || channelBase == 0x10008000u))
             {
+                // DMA addresses with bit 31 set are scratchpad offsets.
+                const auto dmaAddress = [](uint32_t address) -> uint32_t
+                {
+                    return (address & 0x80000000u) != 0u ? PS2_SCRATCHPAD_BASE | (address & (PS2_SCRATCHPAD_SIZE - 16u))
+                                                         : address;
+                };
                 auto enqueueTransfer = [&](uint32_t srcAddr, uint32_t qwCount)
                 {
                     if (qwCount == 0)
                         return;
+                    srcAddr = dmaAddress(srcAddr);
                     const bool scratch = isScratchpad(srcAddr);
                     PendingTransfer pt;
                     pt.fromScratchpad = scratch;
@@ -1436,12 +1443,13 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                 }
                 else if (mode == 1)
                 {
-                    uint32_t tagAddr = m_ioRegisters[channelBase + 0x30];
+                    uint32_t tagAddr = dmaAddress(m_ioRegisters[channelBase + 0x30]);
                     uint32_t asr0 = m_ioRegisters[channelBase + 0x40];
                     uint32_t asr1 = m_ioRegisters[channelBase + 0x50];
                     uint32_t asp = (chcr >> 4) & 0x3u;
                     const bool tieEnabled = (chcr & (1u << 7)) != 0u;
-                    const int kMaxChainTags = 4096;
+                    // A guard against chains that loop forever, far above any real frame.
+                    const int kMaxChainTags = 1 << 20;
                     std::vector<uint8_t> chainBuf;
 
                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
@@ -1535,7 +1543,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                         uint16_t tagQwc = static_cast<uint16_t>(tag & 0xFFFF);
                         uint32_t id = static_cast<uint32_t>((tag >> 28) & 0x7);
                         const bool irq = ((tag >> 31) & 0x1ull) != 0ull;
-                        uint32_t addr = static_cast<uint32_t>((tag >> 32) & 0x7FFFFFFF);
+                        uint32_t addr = dmaAddress(static_cast<uint32_t>(tag >> 32));
                         lastTagUpper = static_cast<uint32_t>((tag >> 16) & 0xFFFFu);
                         ++tagsProcessed;
 

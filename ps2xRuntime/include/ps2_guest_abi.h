@@ -48,6 +48,9 @@ namespace ps2_guest
                              Ps2GuestBranchKind kind,
                              const char *debugName);
     bool eeCheckpointDue(PS2Runtime *runtime, uint32_t cycles = 32u) noexcept;
+    // COP0 Count: the EE cycle counter, plus the offset MTC0 Count left in ctx->cop0_count.
+    uint32_t readCop0Count(PS2Runtime *runtime, R5900Context *ctx) noexcept;
+    void writeCop0Count(PS2Runtime *runtime, R5900Context *ctx, uint32_t value) noexcept;
 
     void SignalException(PS2Runtime *runtime, R5900Context *ctx, PS2Exception exception);
     void handleSyscall(PS2Runtime *runtime, uint8_t *rdram, R5900Context *ctx, uint32_t encodedSyscallId);

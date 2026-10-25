@@ -1307,6 +1307,67 @@ void register_code_generator_tests()
                      "PCPYLD should use PS2_PCPYLD helper");
         });
 
+        tc.Run("SQRT.S takes its operand from ft", [](TestCase &t) {
+            CodeGenerator gen({}, {});
+
+            Instruction sqrt{};
+            sqrt.opcode = OPCODE_COP1;
+            sqrt.rs = COP1_S;
+            sqrt.function = COP1_S_SQRT;
+            sqrt.rt = 4; // ft
+            sqrt.rd = 0; // fs, unused
+            sqrt.sa = 2; // fd
+
+            const std::string out = gen.translateInstruction(sqrt);
+            t.IsTrue(out.find("ctx->f[2] = FPU_SQRT_S(ctx->f[4])") != std::string::npos, "SQRT.S fd, ft should read ft");
+        });
+
+        tc.Run("Quadword loads and stores ignore the low four address bits", [](TestCase &t) {
+            CodeGenerator gen({}, {});
+
+            for (uint32_t opcode : {OPCODE_LQ, OPCODE_SQ, OPCODE_LQC2, OPCODE_SQC2})
+            {
+                Instruction inst{};
+                inst.opcode = opcode;
+                inst.rs = 5;
+                inst.rt = 6;
+                inst.simmediate = 4;
+                inst.immediate = 4;
+                const std::string out = gen.translateInstruction(inst);
+                t.IsTrue(out.find("((ADD32(GPR_U32(ctx, 5), 4)) & ~0xFu)") != std::string::npos,
+                         "the quadword address should be masked to 16 bytes");
+            }
+        });
+
+        tc.Run("MMI exchanges and rotates move the right lanes", [](TestCase &t) {
+            CodeGenerator gen({}, {});
+
+            struct LaneCase
+            {
+                uint8_t function;
+                uint8_t subfunction;
+                const char *expected;
+            };
+            const LaneCase cases[] = {
+                {MMI_MMI2, MMI2_PEXEH, "_MM_SHUFFLE(3,0,1,2)), _MM_SHUFFLE(3,0,1,2))"},
+                {MMI_MMI3, MMI3_PEXCH, "_MM_SHUFFLE(3,1,2,0)), _MM_SHUFFLE(3,1,2,0))"},
+                {MMI_MMI3, MMI3_PEXCW, "_mm_shuffle_epi32(GPR_VEC(ctx, 8), _MM_SHUFFLE(3,1,2,0))"},
+                {MMI_MMI2, MMI2_PROT3W, "_mm_shuffle_epi32(GPR_VEC(ctx, 8), _MM_SHUFFLE(3,0,2,1))"},
+            };
+            for (const LaneCase &c : cases)
+            {
+                Instruction inst{};
+                inst.isMMI = true;
+                inst.opcode = OPCODE_MMI;
+                inst.function = c.function;
+                inst.sa = c.subfunction;
+                inst.rd = 6;
+                inst.rt = 8;
+                const std::string out = gen.translateInstruction(inst);
+                t.IsTrue(out.find(c.expected) != std::string::npos, out);
+            }
+        });
+
         tc.Run("Unary MMI permutations read their source from rt", [](TestCase &t) {
             CodeGenerator gen({}, {});
 

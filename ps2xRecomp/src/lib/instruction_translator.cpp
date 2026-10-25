@@ -129,13 +129,29 @@ namespace ps2recomp
 
         const MemoryAccessHint effectiveMemoryHint = effectiveMemoryHintFor(inst, memoryHint);
 
+        // LQ, SQ, LQC2 and SQC2 ignore the low four bits of the address.
+        auto quadwordHint = [&]()
+        {
+            MemoryAccessHint hint = effectiveMemoryHint;
+            hint.address &= ~0xFu;
+            return hint;
+        };
+        auto quadwordAddress = [](const std::string &addr)
+        {
+            return fmt::format("(({}) & ~0xFu)", addr);
+        };
+
         auto genRead = [&](int width, const std::string &addr)
         {
+            if (width == 128)
+                return translateMemoryRead(inst, quadwordHint(), width, quadwordAddress(addr));
             return translateMemoryRead(inst, effectiveMemoryHint, width, addr);
         };
 
         auto genWrite = [&](int width, const std::string &addr, const std::string &val)
         {
+            if (width == 128)
+                return translateMemoryWrite(inst, quadwordHint(), width, quadwordAddress(addr), val);
             return translateMemoryWrite(inst, effectiveMemoryHint, width, addr, val);
         };
 
