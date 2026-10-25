@@ -1769,13 +1769,24 @@ void EeScheduler::processPendingEvents()
         // unmasked (SIGMSK, FINISHMSK). The handler clears the CSR bit, which
         // re-arms the event.
         GSRegisters &gs = m_runtime.memory().gs();
-        const uint32_t events = static_cast<uint32_t>(gs.csr.load(std::memory_order_acquire)) & 0x3u;
-        const uint32_t unmasked = events & ~static_cast<uint32_t>((gs.imr >> 8) & 0x3u);
-        const uint32_t rising = unmasked & ~m_gsIrqRaised;
-        m_gsIrqRaised = unmasked;
-        if (rising != 0u)
+        // A SIGNAL the GS held while the last one was pending is a new event,
+        // even when no check saw the bit clear in between.
+        if (m_runtime.gs().releaseDeferredSignal())
         {
-            dispatchIrq(false, 0u);
+            m_gsIrqRaised &= ~0x1u;
+        }
+        // While INTC cause 0 is disabled the event stays pending (INTC_STAT
+        // latches it) and is raised once the cause is enabled again.
+        if ((m_enabledIntcMask & 0x1u) != 0u)
+        {
+            const uint32_t events = static_cast<uint32_t>(gs.csr.load(std::memory_order_acquire)) & 0x3u;
+            const uint32_t unmasked = events & ~static_cast<uint32_t>((gs.imr >> 8) & 0x3u);
+            const uint32_t rising = unmasked & ~m_gsIrqRaised;
+            m_gsIrqRaised = unmasked;
+            if (rising != 0u)
+            {
+                dispatchIrq(false, 0u);
+            }
         }
     }
     // Interrupts devices raised from inside memory accesses (IPU, its DMA channels).
