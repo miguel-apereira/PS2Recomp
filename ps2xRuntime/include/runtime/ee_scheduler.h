@@ -353,6 +353,10 @@ public:
     [[nodiscard]] const GuestThread *currentThread() const;
     [[nodiscard]] int currentThreadId() const noexcept;
     [[nodiscard]] R5900Context *currentContext();
+    // The context that holds VU0's registers now: the one running guest code,
+    // or between guest runs the scheduler's own copy. VU0 is one unit on the
+    // PS2, so host code that runs VU0 (VIF0's MSCAL) should use this one.
+    [[nodiscard]] R5900Context &vu0Context();
     [[nodiscard]] uint8_t *rdram() const noexcept;
 
     // Direct syscall tests use the same main-thread record without starting a
@@ -399,6 +403,8 @@ private:
     void copyMainContextToRuntime();
     void publishDebugContext(const R5900Context &context);
     void publishIdleDebugContext();
+    void loadVu0(R5900Context &context);
+    void saveVu0();
 
     PS2Runtime &m_runtime;
     uint8_t *m_rdram = nullptr;
@@ -436,6 +442,13 @@ private:
     std::atomic<bool> m_stopRequested{false};
     std::atomic<bool> m_checkpointPending{false};
     uint32_t m_debugPublishCountdown = 0u;
+    // VU0's registers and COP2 control registers belong to the chip, not to
+    // a thread: the EE kernel does not switch them, interrupt handlers see
+    // what the interrupted code left, and VIF0 runs microprograms on them.
+    // They are kept here between guest runs and loaded into the context that
+    // runs next (m_vu0Context while it runs).
+    R5900Context m_vu0Home{};
+    R5900Context *m_vu0Context = nullptr;
 
     mutable std::mutex m_eventMutex;
     std::condition_variable m_eventCv;

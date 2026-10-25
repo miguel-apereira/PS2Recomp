@@ -72,6 +72,9 @@ namespace
     constexpr uint32_t kInvocationQueuePc = 0x00160530u;
     constexpr uint32_t kInvocationQueueResumePc = 0x00160540u;
     constexpr uint32_t kInvocationQueueHandlerPc = 0x00160550u;
+    constexpr uint32_t kVu0WaitPc = 0x00160600u;
+    constexpr uint32_t kVu0ResumePc = 0x00160610u;
+    constexpr uint32_t kVu0HandlerPc = 0x00160620u;
 
     constexpr uint32_t kTimer2Count = 0x10001000u;
     constexpr uint32_t kTimer2Mode = 0x10001010u;
@@ -97,6 +100,10 @@ namespace
     uint32_t g_invocationQueueRuns = 0u;
     uint32_t g_invocationQueueSp = 0u;
     bool g_invocationQueueSpChanged = false;
+    float g_vu0HandlerVf5[4] = {};
+    float g_vu0HandlerVf0W = 0.0f;
+    uint16_t g_vu0HandlerVi3 = 0u;
+    float g_vu0ResumedVf6[4] = {};
 
     void setRegU32(R5900Context &ctx, int reg, uint32_t value)
     {
@@ -194,6 +201,34 @@ namespace
     void schedulerIrqResume(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
     {
         g_dispatchTrace.push_back(3);
+        ctx->pc = 0u;
+        runtime->requestStop();
+    }
+
+    // VU0 is one unit: an interrupt handler sees the registers the
+    // interrupted thread left, and the thread sees what the handler left.
+    void schedulerVu0Handler(uint8_t *, R5900Context *ctx, PS2Runtime *)
+    {
+        _mm_storeu_ps(g_vu0HandlerVf5, ctx->vu0_vf[5]);
+        g_vu0HandlerVf0W = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[0], ctx->vu0_vf[0], _MM_SHUFFLE(3, 3, 3, 3)));
+        g_vu0HandlerVi3 = ctx->vi[3];
+        ctx->vu0_vf[6] = _mm_set_ps(8.0f, 7.0f, 6.0f, 5.0f);
+        ctx->pc = 0u;
+    }
+
+    void schedulerVu0Wait(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        EeScheduler &scheduler = runtime->eeScheduler();
+        scheduler.addIrqHandler(false, 2u, kVu0HandlerPc, true, 0u, 0u, 0u);
+        ctx->vu0_vf[5] = _mm_set_ps(4.0f, 3.0f, 2.0f, 1.0f);
+        ctx->vi[3] = 0x1234u;
+        ctx->pc = kVu0ResumePc;
+        scheduler.waitVSync(scheduler.currentVSyncTick());
+    }
+
+    void schedulerVu0Resume(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        _mm_storeu_ps(g_vu0ResumedVf6, ctx->vu0_vf[6]);
         ctx->pc = 0u;
         runtime->requestStop();
     }
@@ -544,6 +579,28 @@ void register_ps2_runtime_interrupt_tests()
                      "the dispatcher should run wait, IRQ frame, then the resumed base context in exact order");
             t.Equals(g_lastIntcArg.load(std::memory_order_relaxed), 0xCAFEu,
                      "the IRQ frame should receive its registered argument");
+        });
+
+        tc.Run("VU0 registers are shared by threads and IRQ handlers", [](TestCase &t)
+        {
+            TestEnv env;
+            env.runtime.registerFunction(kVu0WaitPc, schedulerVu0Wait);
+            env.runtime.registerFunction(kVu0ResumePc, schedulerVu0Resume);
+            env.runtime.registerFunction(kVu0HandlerPc, schedulerVu0Handler);
+
+            R5900Context mainContext{};
+            mainContext.pc = kVu0WaitPc;
+            env.runtime.eeScheduler().reset(env.rdram.data(), mainContext);
+            env.runtime.eeScheduler().run();
+
+            t.IsTrue(g_vu0HandlerVf5[0] == 1.0f && g_vu0HandlerVf5[1] == 2.0f && g_vu0HandlerVf5[2] == 3.0f &&
+                         g_vu0HandlerVf5[3] == 4.0f,
+                     "the IRQ handler should see the VF registers the thread left");
+            t.Equals(g_vu0HandlerVi3, static_cast<uint16_t>(0x1234u), "the IRQ handler should see the thread's VI registers");
+            t.IsTrue(g_vu0HandlerVf0W == 1.0f, "VF0.w should read 1.0 in an IRQ handler");
+            t.IsTrue(g_vu0ResumedVf6[0] == 5.0f && g_vu0ResumedVf6[1] == 6.0f && g_vu0ResumedVf6[2] == 7.0f &&
+                         g_vu0ResumedVf6[3] == 8.0f,
+                     "the thread should see the VF registers the IRQ handler left");
         });
 
         tc.Run("IRQ callbacks use an isolated invocation stack", [](TestCase &t)

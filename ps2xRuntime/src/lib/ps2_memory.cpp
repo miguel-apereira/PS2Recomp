@@ -1259,6 +1259,19 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
         return true;
     }
 
+    if (address == 0x1000E000u && (value & 0xFCu) != 0u)
+    {
+        // D_CTRL.MFD (MFIFO), STS and STD (stall control) change where and
+        // how far channels transfer; none of them is modelled yet.
+        static uint32_t reported = 0u;
+        if (reported != value)
+        {
+            reported = value;
+            std::cerr << "[dma] D_CTRL 0x" << std::hex << value << std::dec
+                      << " asks for MFIFO or stall control, which are not modelled" << std::endl;
+        }
+    }
+
     m_ioRegisters[address] = value;
 
     if (m_vif[1] && address >= 0x10003C00u && address < 0x10003E00u)
@@ -1382,6 +1395,17 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
             if (tryProcessScratchpadDma(channelBase, value))
             {
                 return true;
+            }
+            if (channelBase == 0x1000D000u || channelBase == 0x1000D400u)
+            {
+                static uint32_t reported = 0u;
+                const uint32_t key = (channelBase == 0x1000D000u ? 1u : 2u) << ((value >> 2) & 0x3u) * 2u;
+                if ((reported & key) == 0u)
+                {
+                    reported |= key;
+                    std::cerr << "[dma] " << (channelBase == 0x1000D000u ? "fromSPR" : "toSPR") << " CHCR 0x" << std::hex
+                              << value << std::dec << ": this mode is not handled; the transfer never happens" << std::endl;
+                }
             }
 
             if ((channelBase == 0x1000A000u || channelBase == 0x10009000u || channelBase == 0x10008000u) && (m_gsVRAM || channelBase == 0x10008000u))
