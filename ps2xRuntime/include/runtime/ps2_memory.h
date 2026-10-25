@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <array>
+#include <limits>
 #include <functional>
 #include <vector>
 #include <unordered_map>
@@ -149,7 +150,18 @@ public:
 
     // EE timers advance from the scheduler's emulated EE-cycle clock. The
     // returned mask uses bits 0..3 for newly raised TIM0..TIM3 interrupts.
-    uint32_t advanceEeTimers(uint64_t eeCycles) noexcept;
+    // The scheduler calls this at every guest checkpoint, so it only adds the
+    // cycles up until the next timer interrupt is due; the timers catch up
+    // then, or when the guest accesses a timer register.
+    uint32_t advanceEeTimers(uint64_t eeCycles) noexcept
+    {
+        if (eeCycles == 0u)
+            return 0u;
+        if (m_gifFifoCountSet)
+            clearGifFifoCount();
+        m_eeTimerPendingCycles += eeCycles;
+        return m_eeTimerPendingCycles < m_eeTimerDueCycles ? 0u : syncEeTimers();
+    }
     [[nodiscard]] uint64_t cyclesUntilNextEeTimerInterrupt() const noexcept;
     void resetEeTimers() noexcept;
 
@@ -316,6 +328,13 @@ public:
     };
 
     std::array<EeTimer, 4> m_eeTimers{};
+    uint64_t m_eeTimerPendingCycles = 0;                                   // not yet applied to m_eeTimers
+    uint64_t m_eeTimerDueCycles = std::numeric_limits<uint64_t>::max(); // from m_eeTimers to the next interrupt
+    bool m_gifFifoCountSet = false;                                        // GIF_STAT.FQC may be nonzero
+    uint32_t stepEeTimers(uint64_t eeCycles) noexcept;
+    uint32_t syncEeTimers() noexcept;
+    [[nodiscard]] uint64_t cyclesUntilEeTimerEvent() const noexcept;
+    void clearGifFifoCount() noexcept;
     bool tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr);
     void completeDmacChannel(uint32_t channelBase, uint32_t cause);
     void queueCompletedDmacCause(uint32_t cause);

@@ -402,20 +402,41 @@ bool PS2Memory::initialize(size_t ramSize)
 void PS2Memory::resetEeTimers() noexcept
 {
     m_eeTimers = {};
+    m_eeTimerPendingCycles = 0u;
+    m_eeTimerDueCycles = std::numeric_limits<uint64_t>::max();
 }
 
-uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
+void PS2Memory::clearGifFifoCount() noexcept
 {
-    if (eeCycles == 0u)
-    {
-        return 0u;
-    }
-
     constexpr uint32_t kGifStat = 0x10003020u;
     constexpr uint32_t kGifFqcMask = 0x1F000000u;
     auto gifStatIt = m_ioRegisters.find(kGifStat);
     if (gifStatIt != m_ioRegisters.end())
         gifStatIt->second &= ~kGifFqcMask;
+    m_gifFifoCountSet = false;
+}
+
+uint32_t PS2Memory::syncEeTimers() noexcept
+{
+    const uint32_t interruptMask = stepEeTimers(m_eeTimerPendingCycles);
+    m_eeTimerPendingCycles = 0u;
+    m_eeTimerDueCycles = cyclesUntilEeTimerEvent();
+    return interruptMask;
+}
+
+uint64_t PS2Memory::cyclesUntilNextEeTimerInterrupt() const noexcept
+{
+    if (m_eeTimerDueCycles == std::numeric_limits<uint64_t>::max())
+        return m_eeTimerDueCycles;
+    return std::max<uint64_t>(1u, m_eeTimerDueCycles - m_eeTimerPendingCycles);
+}
+
+uint32_t PS2Memory::stepEeTimers(uint64_t eeCycles) noexcept
+{
+    if (eeCycles == 0u)
+    {
+        return 0u;
+    }
 
     uint32_t interruptMask = 0u;
     for (size_t index = 0; index < m_eeTimers.size(); ++index)
@@ -480,7 +501,7 @@ uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
     return interruptMask;
 }
 
-uint64_t PS2Memory::cyclesUntilNextEeTimerInterrupt() const noexcept
+uint64_t PS2Memory::cyclesUntilEeTimerEvent() const noexcept
 {
     uint64_t nearest = std::numeric_limits<uint64_t>::max();
     for (const EeTimer &timer : m_eeTimers)
@@ -1146,6 +1167,8 @@ void PS2Memory::write128(uint32_t address, __m128i value)
 
 bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 {
+    if (address == 0x10003020u) // GIF_STAT: the FIFO count it may hold drains as time passes
+        m_gifFifoCountSet = true;
     if (m_ipu)
     {
         if (address >= 0x10002000u && address < 0x10002040u)
@@ -1171,6 +1194,9 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
     uint32_t timerOffset = 0u;
     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
     {
+        // The timers are behind by the cycles not yet applied; no event is due
+        // in them (advanceEeTimers applies them when one is), so this raises nothing.
+        (void)syncEeTimers();
         EeTimer &timer = m_eeTimers[timerIndex];
         switch (timerOffset)
         {
@@ -1198,6 +1224,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
         default:
             return false;
         }
+        m_eeTimerDueCycles = cyclesUntilEeTimerEvent();
         return true;
     }
 
@@ -1750,6 +1777,7 @@ void PS2Memory::processPendingTransfers()
         constexpr uint32_t kGifFqcMask = 0x1F000000u;
         uint32_t &gifStat = m_ioRegisters[kGifStat];
         gifStat = (gifStat & ~kGifFqcMask) | (observedGifQwc << 24u);
+        m_gifFifoCountSet = true;
     }
 
     for (size_t idx = 0; idx < m_pendingGifTransfers.size(); ++idx)
@@ -2384,6 +2412,7 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
     uint32_t timerOffset = 0u;
     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
     {
+        (void)syncEeTimers();
         const EeTimer &timer = m_eeTimers[timerIndex];
         switch (timerOffset)
         {
@@ -2755,6 +2784,22 @@ void PS2Memory::serviceVif(int unit)
     const uint32_t kAsr0 = base + 0x40u;
     const uint32_t kAsr1 = base + 0x50u;
     bool &chainEnding = m_vifChainEnding[unit];
+    // The channel's registers, looked up once: this runs for every quadword
+    // the VIF takes, and the map's elements stay where they are.
+    uint32_t &chcrReg = m_ioRegisters[kChcr];
+    if ((chcrReg & 0x100u) == 0u) // the channel is not running (FIFO writes and VIF registers)
+    {
+        if (vif->takeInterrupt())
+        {
+            m_pendingIntc.fetch_or(1u << (4 + unit), std::memory_order_acq_rel);
+        }
+        return;
+    }
+    uint32_t &madrReg = m_ioRegisters[kMadr];
+    uint32_t &qwcReg = m_ioRegisters[kQwc];
+    uint32_t &tadrReg = m_ioRegisters[kTadr];
+    uint32_t &asr0Reg = m_ioRegisters[kAsr0];
+    uint32_t &asr1Reg = m_ioRegisters[kAsr1];
 
     // DMA addresses: bit 31 selects the scratchpad.
     const auto guestPointer = [this](uint32_t address) -> uint8_t *
@@ -2768,7 +2813,7 @@ void PS2Memory::serviceVif(int unit)
     };
     const auto finish = [&]()
     {
-        m_ioRegisters[kChcr] &= ~0x100u;
+        chcrReg &= ~0x100u;
         m_ioRegisters[0x1000E010u] |= 1u << unit;
         m_pendingDmac.fetch_or(1u << unit, std::memory_order_acq_rel);
         chainEnding = false;
@@ -2776,28 +2821,28 @@ void PS2Memory::serviceVif(int unit)
     // Sends QWC quadwords from MADR, as far as the VIF takes them.
     const auto sendData = [&]() -> bool
     {
-        while ((m_ioRegisters[kQwc] & 0xFFFFu) != 0u)
+        while ((qwcReg & 0xFFFFu) != 0u)
         {
             if (vif->stalled())
             {
                 return false;
             }
-            const uint32_t madr = m_ioRegisters[kMadr];
+            const uint32_t madr = madrReg;
             uint32_t words[4] = {};
             if (const uint8_t *source = guestPointer(madr))
             {
                 std::memcpy(words, source, sizeof(words));
             }
             vif->pushData(words, 4u);
-            m_ioRegisters[kMadr] = madr + 16u;
-            m_ioRegisters[kQwc] = (m_ioRegisters[kQwc] & 0xFFFFu) - 1u;
+            madrReg = madr + 16u;
+            qwcReg = (qwcReg & 0xFFFFu) - 1u;
         }
         return true;
     };
 
-    if (unit == 1 && (m_ioRegisters[kChcr] & 0x101u) == 0x100u)
+    if (unit == 1 && (chcrReg & 0x101u) == 0x100u)
     {
-        const uint32_t qwc = m_ioRegisters[kQwc] & 0xFFFFu;
+        const uint32_t qwc = qwcReg & 0xFFFFu;
         std::vector<uint8_t> data(static_cast<size_t>(qwc) * 16u, 0u);
         if (m_gsDownloadCallback && !data.empty())
         {
@@ -2805,17 +2850,17 @@ void PS2Memory::serviceVif(int unit)
         }
         for (uint32_t i = 0; i < qwc; ++i)
         {
-            if (uint8_t *target = guestPointer(m_ioRegisters[kMadr]))
+            if (uint8_t *target = guestPointer(madrReg))
             {
                 std::memcpy(target, data.data() + static_cast<size_t>(i) * 16u, 16u);
             }
-            m_ioRegisters[kMadr] += 16u;
+            madrReg += 16u;
         }
-        m_ioRegisters[kQwc] &= ~0xFFFFu;
+        qwcReg &= ~0xFFFFu;
         finish();
     }
 
-    for (int tags = 0; (m_ioRegisters[kChcr] & 0x100u) != 0u && tags < 65536; ++tags)
+    for (int tags = 0; (chcrReg & 0x100u) != 0u && tags < 65536; ++tags)
     {
         const auto dctrl = m_ioRegisters.find(0x1000E000u);
         if (dctrl != m_ioRegisters.end() && (dctrl->second & 0x1u) == 0u)
@@ -2827,7 +2872,7 @@ void PS2Memory::serviceVif(int unit)
             break;
         }
 
-        const uint32_t chcr = m_ioRegisters[kChcr];
+        const uint32_t chcr = chcrReg;
         const uint32_t mode = (chcr >> 2) & 0x3u;
         if (mode != 1u || chainEnding)
         {
@@ -2840,7 +2885,7 @@ void PS2Memory::serviceVif(int unit)
         }
 
         // The next source-chain tag.
-        const uint32_t tadr = m_ioRegisters[kTadr];
+        const uint32_t tadr = tadrReg;
         uint32_t tag[4] = {};
         if (const uint8_t *source = guestPointer(tadr))
         {
@@ -2850,55 +2895,55 @@ void PS2Memory::serviceVif(int unit)
         const uint32_t id = (tag[0] >> 28) & 0x7u;
         const bool irq = (tag[0] & 0x80000000u) != 0u;
         const uint32_t addr = tag[1] & 0xFFFFFFF0u;
-        m_ioRegisters[kChcr] = (chcr & 0xFFFFu) | (tag[0] & 0xFFFF0000u);
+        chcrReg = (chcr & 0xFFFFu) | (tag[0] & 0xFFFF0000u);
         if ((chcr & 0x40u) != 0u) // TTE: the tag's upper half goes to the VIF first
         {
             vif->pushData(&tag[2], 2u);
         }
-        m_ioRegisters[kQwc] = qwc;
+        qwcReg = qwc;
 
         bool end = false;
         const uint32_t asp = (chcr >> 4) & 0x3u;
         switch (id)
         {
         case 0: // refe
-            m_ioRegisters[kMadr] = addr;
-            m_ioRegisters[kTadr] = tadr + 16u;
+            madrReg = addr;
+            tadrReg = tadr + 16u;
             end = true;
             break;
         case 1: // cnt
-            m_ioRegisters[kMadr] = tadr + 16u;
-            m_ioRegisters[kTadr] = tadr + 16u + qwc * 16u;
+            madrReg = tadr + 16u;
+            tadrReg = tadr + 16u + qwc * 16u;
             break;
         case 2: // next
-            m_ioRegisters[kMadr] = tadr + 16u;
-            m_ioRegisters[kTadr] = addr;
+            madrReg = tadr + 16u;
+            tadrReg = addr;
             break;
         case 3: // ref
         case 4: // refs
-            m_ioRegisters[kMadr] = addr;
-            m_ioRegisters[kTadr] = tadr + 16u;
+            madrReg = addr;
+            tadrReg = tadr + 16u;
             break;
         case 5: // call
-            m_ioRegisters[kMadr] = tadr + 16u;
-            m_ioRegisters[asp == 0u ? kAsr0 : kAsr1] = tadr + 16u + qwc * 16u;
-            m_ioRegisters[kChcr] = (m_ioRegisters[kChcr] & ~0x30u) | (std::min(asp + 1u, 2u) << 4);
-            m_ioRegisters[kTadr] = addr;
+            madrReg = tadr + 16u;
+            (asp == 0u ? asr0Reg : asr1Reg) = tadr + 16u + qwc * 16u;
+            chcrReg = (chcrReg & ~0x30u) | (std::min(asp + 1u, 2u) << 4);
+            tadrReg = addr;
             break;
         case 6: // ret
-            m_ioRegisters[kMadr] = tadr + 16u;
+            madrReg = tadr + 16u;
             if (asp == 0u)
             {
                 end = true;
             }
             else
             {
-                m_ioRegisters[kTadr] = m_ioRegisters[asp == 2u ? kAsr1 : kAsr0];
-                m_ioRegisters[kChcr] = (m_ioRegisters[kChcr] & ~0x30u) | ((asp - 1u) << 4);
+                tadrReg = (asp == 2u ? asr1Reg : asr0Reg);
+                chcrReg = (chcrReg & ~0x30u) | ((asp - 1u) << 4);
             }
             break;
         default: // end
-            m_ioRegisters[kMadr] = tadr + 16u;
+            madrReg = tadr + 16u;
             end = true;
             break;
         }

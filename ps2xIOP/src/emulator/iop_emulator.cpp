@@ -18,6 +18,7 @@
 #include "iop_emulator_const.h"
 
 #include <algorithm>
+#include <limits>
 #include <cctype>
 #include <map>
 #include <optional>
@@ -131,6 +132,7 @@ namespace ps2x::iop::detail
             totalCycles = 0;
             totalInstructions = 0;
             eeCycleCarry = 0;
+            idleUntil = 0;
             activeCpu = nullptr;
             lastError.clear();
             servicingDmaInterrupts = false;
@@ -566,12 +568,14 @@ namespace ps2x::iop::detail
                     IopThread *next = kernel.beginNextReady(totalCycles);
                     if (!next)
                     {
-                        uint64_t nextWake = kernel.nextWakeCycle(target);
+                        uint64_t nextWake = kernel.nextWakeCycle(std::numeric_limits<uint64_t>::max());
                         for (const auto &[irq, completionCycle] : pendingDmaInterrupts)
                             nextWake = std::min(nextWake, completionCycle);
                         if (!pendingGuestCallbacks.empty())
                             nextWake = std::min(nextWake, pendingGuestCallbacks.begin()->first);
                         nextWake = timrman.nextEventCycle(nextWake);
+                        if (nextWake > target)
+                            idleUntil = nextWake;
                         totalCycles = std::max(totalCycles + 1u, std::min(target, nextWake));
                         continue;
                     }
@@ -702,6 +706,9 @@ namespace ps2x::iop::detail
         uint64_t totalCycles = 0;
         uint64_t totalInstructions = 0;
         uint64_t eeCycleCarry = 0;
+        // No thread is ready and nothing is due before this IOP cycle, unless
+        // the EE side calls in (wake() clears it).
+        uint64_t idleUntil = 0;
         CpuState *activeCpu = nullptr;
         std::string lastError;
         bool servicingDmaInterrupts = false;
@@ -719,6 +726,17 @@ namespace ps2x::iop::detail
 
     IopEmulator::~IopEmulator() = default;
 
+    // Every call from the EE side may wake an IOP thread or schedule
+    // something, so the idle skip in runEeCycles ends after each one.
+    namespace
+    {
+        struct WakeAfter
+        {
+            uint64_t &idleUntil;
+            ~WakeAfter() { idleUntil = 0; }
+        };
+    }
+
     void IopEmulator::reset()
     {
         m_impl->reset();
@@ -726,30 +744,49 @@ namespace ps2x::iop::detail
 
     ModuleLoadResult IopEmulator::loadModule(std::string_view path, const void *arguments, uint32_t argumentSize)
     {
+        const WakeAfter wake{m_impl->idleUntil};
         return m_impl->loadModule(path, arguments, argumentSize);
     }
 
     ModuleLoadResult IopEmulator::loadModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize)
     {
+        const WakeAfter wake{m_impl->idleUntil};
         return m_impl->loadModuleBuffer(guestAddress, arguments, argumentSize);
     }
 
     bool IopEmulator::stopModule(int32_t moduleId, int32_t *result)
     {
+        const WakeAfter wake{m_impl->idleUntil};
         return m_impl->stopModule(moduleId, result);
     }
 
+    // The EE scheduler calls this at every guest checkpoint, a few EE cycles
+    // at a time. The IOP runs in batches of at least kMinIopBatchCycles, and
+    // while it is idle (no thread ready, nothing due) its clock just moves on.
     void IopEmulator::runEeCycles(uint64_t eeCycles) noexcept
     {
-        const uint64_t total = m_impl->eeCycleCarry + eeCycles;
+        Impl &impl = *m_impl;
+        const uint64_t total = impl.eeCycleCarry + eeCycles;
         const uint64_t iopCycles = total / 8u;
-        m_impl->eeCycleCarry = total % 8u;
-        if (iopCycles)
-            m_impl->runCycles(iopCycles);
+        if (impl.totalCycles + iopCycles < impl.idleUntil)
+        {
+            impl.totalCycles += iopCycles;
+            impl.eeCycleCarry = total % 8u;
+            return;
+        }
+        if (iopCycles < kMinIopBatchCycles)
+        {
+            impl.eeCycleCarry = total;
+            return;
+        }
+        impl.eeCycleCarry = total % 8u;
+        impl.idleUntil = 0;
+        impl.runCycles(iopCycles);
     }
 
     RpcResult IopEmulator::handleRpc(const RpcRequest &request)
     {
+        const WakeAfter wake{m_impl->idleUntil};
         return m_impl->rpc.handleRpc(request, *m_impl);
     }
 
@@ -760,16 +797,19 @@ namespace ps2x::iop::detail
 
     void IopEmulator::onSifTransfer(const SifTransfer &transfer)
     {
+        const WakeAfter wake{m_impl->idleUntil};
         m_impl->rpc.onSifTransfer(transfer);
     }
 
     uint32_t IopEmulator::allocateMemory(uint32_t size, uint32_t alignment)
     {
+        const WakeAfter wake{m_impl->idleUntil};
         return m_impl->memory.allocate(size, alignment);
     }
 
     bool IopEmulator::freeMemory(uint32_t address)
     {
+        const WakeAfter wake{m_impl->idleUntil};
         return m_impl->memory.freeAllocation(address);
     }
 
@@ -781,12 +821,14 @@ namespace ps2x::iop::detail
 
     bool IopEmulator::writeMemory(uint32_t address, const void *source, size_t size)
     {
+        const WakeAfter wake{m_impl->idleUntil};
         return isMemoryRange(address, size) &&
                m_impl->memory.writeRam(address, source, size);
     }
 
     bool IopEmulator::zeroMemory(uint32_t address, size_t size)
     {
+        const WakeAfter wake{m_impl->idleUntil};
         return isMemoryRange(address, size) &&
                m_impl->memory.zeroRam(address, size);
     }
@@ -804,7 +846,7 @@ namespace ps2x::iop::detail
 
     uint64_t IopEmulator::cycles() const noexcept
     {
-        return m_impl->totalCycles;
+        return m_impl->totalCycles + m_impl->eeCycleCarry / 8u;
     }
 
     uint64_t IopEmulator::instructions() const noexcept
