@@ -155,6 +155,7 @@ void GS::reset()
     m_trxpos = {};
     m_trxreg = {};
     m_trxdir = 3;
+    m_deferredSignals.clear();
     m_vtxCount = 0;
     m_vtxIndex = 0;
     m_preferredDisplaySourceFrame = {};
@@ -1474,6 +1475,20 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     {
         if (m_privRegs)
         {
+            // The GS stalls on a second SIGNAL until the CPU clears the first,
+            // so each one reaches the CPU as its own event. Folding them into
+            // one CSR bit would lose interrupts that games count (a semaphore
+            // per SIGNAL, say).
+            if ((m_privRegs->csr.load(std::memory_order_acquire) & 0x1u) != 0u)
+            {
+                if (m_deferredSignals.size() >= 256u) // never cleared: keep the newest
+                    m_deferredSignals.pop_front();
+                m_deferredSignals.push_back(value);
+                if (++m_deferredSignalCount <= 4u)
+                    std::cout << "[gs] SIGNAL while CSR.SIGNAL is set: held until it is cleared ("
+                              << m_deferredSignalCount << ")" << std::endl;
+                break;
+            }
             uint32_t id = static_cast<uint32_t>(value & 0xFFFFFFFF);
             uint32_t mask = static_cast<uint32_t>(value >> 32);
             uint32_t lo = static_cast<uint32_t>(m_privRegs->siglblid & 0xFFFFFFFF);
@@ -1637,6 +1652,18 @@ bool GS::clearActiveFramebuffer(uint32_t rgba)
     if (m_host && m_host->clearFrame(m_prim.ctxt ? 1u : 0u, rgba))
         return true;
     return m_backend && m_backend->ClearFramebuffer(activeContext(), rgba);
+}
+
+bool GS::releaseDeferredSignal()
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    if (m_deferredSignals.empty() || !m_privRegs ||
+        (m_privRegs->csr.load(std::memory_order_acquire) & 0x1u) != 0u)
+        return false;
+    const uint64_t value = m_deferredSignals.front();
+    m_deferredSignals.pop_front();
+    writeRegisterUnlocked(GS_REG_SIGNAL, value);
+    return true;
 }
 
 uint32_t GS::consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)

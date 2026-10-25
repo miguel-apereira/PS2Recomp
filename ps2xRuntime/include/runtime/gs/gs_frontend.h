@@ -4,6 +4,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -153,6 +154,12 @@ public:
 
     uint32_t consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes);
 
+    // A SIGNAL that arrives while CSR.SIGNAL is still set waits, as the GS
+    // stalls on it, until the CPU clears the bit. Then this applies it (sets
+    // SIGLBLID and CSR.SIGNAL again) and returns true, so every SIGNAL raises
+    // its own interrupt. Called by the EE scheduler when it checks GS events.
+    bool releaseDeferredSignal();
+
     void refreshDisplaySnapshot();
 
     void WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value);
@@ -191,6 +198,8 @@ private:
     uint32_t m_localMemorySize = 0u;
     struct GSRegisters *m_privRegs = nullptr;
     mutable std::recursive_mutex m_stateMutex;
+    std::deque<uint64_t> m_deferredSignals; // SIGNAL values waiting for CSR.SIGNAL to clear
+    uint64_t m_deferredSignalCount = 0u;
     mutable std::mutex m_backendLifetimeMutex;
     mutable std::mutex m_presentationMutex;
 
