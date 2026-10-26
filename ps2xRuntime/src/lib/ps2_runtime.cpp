@@ -2726,6 +2726,16 @@ namespace ps2_guest
         return runtime->eeCheckpointDue(cycles);
     }
 
+    uint32_t readCop0Count(PS2Runtime *runtime, R5900Context *ctx) noexcept
+    {
+        return static_cast<uint32_t>(runtime->eeScheduler().eeCycle()) + ctx->cop0_count;
+    }
+
+    void writeCop0Count(PS2Runtime *runtime, R5900Context *ctx, uint32_t value) noexcept
+    {
+        ctx->cop0_count = value - static_cast<uint32_t>(runtime->eeScheduler().eeCycle());
+    }
+
     void SignalException(PS2Runtime *runtime, R5900Context *ctx, PS2Exception exception)
     {
         runtime->SignalException(ctx, exception);

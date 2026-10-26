@@ -135,6 +135,10 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     m_runtime.memory().gs().vsyncTick.store(0u, std::memory_order_release);
     m_runtime.memory().resetEeTimers();
 
+    m_vu0Home = mainContext;
+    m_vu0Home.vu0_vf[0] = _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f);
+    m_vu0Context = nullptr;
+
     GuestThread main{};
     main.id = kMainThreadId;
     main.context = mainContext;
@@ -297,18 +301,23 @@ void EeScheduler::run()
         try
         {
             m_insideInterrupt = !running->invocations.empty() && running->invocations.back().kind == GuestInvocationKind::Interrupt;
+            loadVu0(context);
             m_guestExecuting.store(true, std::memory_order_release);
             function(m_rdram, &context, &m_runtime);
             m_guestExecuting.store(false, std::memory_order_release);
+            saveVu0();
             m_insideInterrupt = false;
         }
         catch (const EeDispatcherTransfer &)
         {
+            // Whatever threw saved VU0 first (the context may be gone now).
+            m_vu0Context = nullptr;
             m_guestExecuting.store(false, std::memory_order_release);
             m_insideInterrupt = false;
         }
         catch (...)
         {
+            m_vu0Context = nullptr;
             m_guestExecuting.store(false, std::memory_order_release);
             m_running.store(false, std::memory_order_release);
             publishSnapshot();
@@ -522,6 +531,7 @@ int EeScheduler::startThread(int id, uint32_t arg, const R5900Context &caller, b
 [[noreturn]] void EeScheduler::exitCurrent(bool deleteThreadRecord)
 {
     assertExecutor();
+    saveVu0();
     GuestThread *exiting = currentThread();
     assert(exiting != nullptr);
     const int id = exiting->id;
@@ -816,6 +826,7 @@ void EeScheduler::transferIfRequested(bool interruptSafe)
     {
         return;
     }
+    saveVu0();
     if (m_currentThreadId != 0)
     {
         GuestThread *self = currentThread();
@@ -1120,6 +1131,7 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
 [[noreturn]] void EeScheduler::invokeCurrent(GuestInvocation invocation)
 {
     assertExecutor();
+    saveVu0(); // before the push moves the context it runs in
     GuestThread *owner = currentThread();
     assert(owner != nullptr);
     if (getRegU32(&invocation.context, 29) == 0u)
@@ -1135,6 +1147,7 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
 [[noreturn]] void EeScheduler::invokeCurrentSequence(std::vector<GuestInvocation> invocations)
 {
     assertExecutor();
+    saveVu0();
     GuestThread *owner = currentThread();
     assert(owner != nullptr);
     assert(!invocations.empty());
@@ -1460,6 +1473,40 @@ R5900Context *EeScheduler::currentContext()
     return self ? &self->activeContext() : nullptr;
 }
 
+namespace
+{
+// VU0's state in R5900Context: vu0_vf through vu0_cf, and the COP2 control registers.
+void copyVu0Registers(const R5900Context &from, R5900Context &to)
+{
+    const auto *begin = reinterpret_cast<const uint8_t *>(&from.vu0_vf);
+    const auto *end = reinterpret_cast<const uint8_t *>(&from.vu0_cf) + sizeof(from.vu0_cf);
+    std::memcpy(reinterpret_cast<uint8_t *>(&to.vu0_vf), begin, static_cast<size_t>(end - begin));
+    std::memcpy(to.cop2_ccr, from.cop2_ccr, sizeof(to.cop2_ccr));
+}
+} // namespace
+
+R5900Context &EeScheduler::vu0Context()
+{
+    return m_vu0Context ? *m_vu0Context : m_vu0Home;
+}
+
+void EeScheduler::loadVu0(R5900Context &context)
+{
+    copyVu0Registers(m_vu0Home, context);
+    m_vu0Context = &context;
+}
+
+// Keeps what the running guest code left in VU0. Call it before anything
+// that can move or free the context it runs in.
+void EeScheduler::saveVu0()
+{
+    if (m_vu0Context)
+    {
+        copyVu0Registers(*m_vu0Context, m_vu0Home);
+        m_vu0Context = nullptr;
+    }
+}
+
 uint8_t *EeScheduler::rdram() const noexcept
 {
     return m_rdram;
@@ -1693,6 +1740,7 @@ void EeScheduler::removeFromWaitObject(GuestThread &item)
 
 void EeScheduler::blockCurrent(EeWaitState wait)
 {
+    saveVu0();
     GuestThread *self = currentThread();
     assert(self != nullptr);
     self->wait = std::move(wait);

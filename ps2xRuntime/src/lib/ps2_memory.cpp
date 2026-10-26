@@ -1286,6 +1286,19 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
         return true;
     }
 
+    if (address == 0x1000E000u && (value & 0xFCu) != 0u)
+    {
+        // D_CTRL.MFD (MFIFO), STS and STD (stall control) change where and
+        // how far channels transfer; none of them is modelled yet.
+        static uint32_t reported = 0u;
+        if (reported != value)
+        {
+            reported = value;
+            std::cerr << "[dma] D_CTRL 0x" << std::hex << value << std::dec
+                      << " asks for MFIFO or stall control, which are not modelled" << std::endl;
+        }
+    }
+
     m_ioRegisters[address] = value;
 
     if (m_vif[1] && address >= 0x10003C00u && address < 0x10003E00u)
@@ -1410,13 +1423,31 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
             {
                 return true;
             }
+            if (channelBase == 0x1000D000u || channelBase == 0x1000D400u)
+            {
+                static uint32_t reported = 0u;
+                const uint32_t key = (channelBase == 0x1000D000u ? 1u : 2u) << ((value >> 2) & 0x3u) * 2u;
+                if ((reported & key) == 0u)
+                {
+                    reported |= key;
+                    std::cerr << "[dma] " << (channelBase == 0x1000D000u ? "fromSPR" : "toSPR") << " CHCR 0x" << std::hex
+                              << value << std::dec << ": this mode is not handled; the transfer never happens" << std::endl;
+                }
+            }
 
             if ((channelBase == 0x1000A000u || channelBase == 0x10009000u || channelBase == 0x10008000u) && (m_gsVRAM || channelBase == 0x10008000u))
             {
+                // DMA addresses with bit 31 set are scratchpad offsets.
+                const auto dmaAddress = [](uint32_t address) -> uint32_t
+                {
+                    return (address & 0x80000000u) != 0u ? PS2_SCRATCHPAD_BASE | (address & (PS2_SCRATCHPAD_SIZE - 16u))
+                                                         : address;
+                };
                 auto enqueueTransfer = [&](uint32_t srcAddr, uint32_t qwCount)
                 {
                     if (qwCount == 0)
                         return;
+                    srcAddr = dmaAddress(srcAddr);
                     const bool scratch = isScratchpad(srcAddr);
                     PendingTransfer pt;
                     pt.fromScratchpad = scratch;
@@ -1439,12 +1470,13 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                 }
                 else if (mode == 1)
                 {
-                    uint32_t tagAddr = m_ioRegisters[channelBase + 0x30];
+                    uint32_t tagAddr = dmaAddress(m_ioRegisters[channelBase + 0x30]);
                     uint32_t asr0 = m_ioRegisters[channelBase + 0x40];
                     uint32_t asr1 = m_ioRegisters[channelBase + 0x50];
                     uint32_t asp = (chcr >> 4) & 0x3u;
                     const bool tieEnabled = (chcr & (1u << 7)) != 0u;
-                    const int kMaxChainTags = 4096;
+                    // A guard against chains that loop forever, far above any real frame.
+                    const int kMaxChainTags = 1 << 20;
                     std::vector<uint8_t> chainBuf;
 
                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
@@ -1538,7 +1570,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                         uint16_t tagQwc = static_cast<uint16_t>(tag & 0xFFFF);
                         uint32_t id = static_cast<uint32_t>((tag >> 28) & 0x7);
                         const bool irq = ((tag >> 31) & 0x1ull) != 0ull;
-                        uint32_t addr = static_cast<uint32_t>((tag >> 32) & 0x7FFFFFFF);
+                        uint32_t addr = dmaAddress(static_cast<uint32_t>(tag >> 32));
                         lastTagUpper = static_cast<uint32_t>((tag >> 16) & 0xFFFFu);
                         ++tagsProcessed;
 
@@ -1710,7 +1742,24 @@ bool PS2Memory::tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr)
         return false;
     }
 
-    if (mainOffset > PS2_RAM_SIZE || byteCount > PS2_RAM_SIZE - mainOffset)
+    // MADR is main RAM or VU memory: games copy VU0 output to the scratchpad
+    // with toSPR straight from VU0 data memory (0x11004000).
+    uint8_t *memory = m_rdram;
+    uint32_t memorySize = PS2_RAM_SIZE;
+    if (mainOffset >= PS2_RAM_SIZE)
+    {
+        uint32_t vuOffset = 0u;
+        uint32_t vuLimit = 0u;
+        uint8_t *vuMem = mapVuMemory(mainOffset, 16u, vuOffset, vuLimit);
+        if (!vuMem)
+            return false;
+        memory = vuMem;
+        memorySize = vuLimit;
+        mainOffset = vuOffset;
+    }
+    // VU memory wraps around; main RAM must hold the whole transfer.
+    const bool wrapsMemory = memory != m_rdram;
+    if (!wrapsMemory && (mainOffset > PS2_RAM_SIZE || byteCount > PS2_RAM_SIZE - mainOffset))
         return false;
 
     const bool fromScratchpad = channelBase == kSprFromChannel;
@@ -1719,16 +1768,22 @@ bool PS2Memory::tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr)
     uint32_t copied = 0u;
     while (bytesLeft != 0u)
     {
-        const uint32_t scratchChunk = PS2_SCRATCHPAD_SIZE - scratchOffset;
-        const uint32_t chunk = std::min(bytesLeft, scratchChunk);
+        const uint32_t memoryAt = wrapsMemory ? (mainOffset + copied) % memorySize : mainOffset + copied;
+        uint32_t chunk = std::min(bytesLeft, PS2_SCRATCHPAD_SIZE - scratchOffset);
+        chunk = std::min(chunk, memorySize - memoryAt);
         if (fromScratchpad)
         {
-            std::memcpy(m_rdram + mainOffset + copied, m_scratchpad + scratchOffset, chunk);
-            markModified(mainOffset + copied, chunk);
+            std::memcpy(memory + memoryAt, m_scratchpad + scratchOffset, chunk);
+            if (memory == m_rdram)
+                markModified(memoryAt, chunk);
+            else if (memory == m_vu0Code)
+                markVU0CodeModified();
+            else if (memory == m_vu1Code)
+                markVU1CodeModified();
         }
         else
         {
-            std::memcpy(m_scratchpad + scratchOffset, m_rdram + mainOffset + copied, chunk);
+            std::memcpy(m_scratchpad + scratchOffset, memory + memoryAt, chunk);
         }
 
         copied += chunk;
