@@ -10,6 +10,8 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <random>
+#include <string>
 #include <vector>
 
 namespace
@@ -307,6 +309,80 @@ void register_ps2_memory_tests()
 
             t.Equals(mem.advanceEeTimers(6u), 1u, "Timer0 compare should raise TIM0 after three BUSCLK ticks");
             t.Equals(mem.readIORegister(kTimer0Count), 0u, "ZRET should clear COUNT when it equals COMP");
+        });
+
+        tc.Run("EE timers give the same interrupts and counts whether or not they are read every step", [](TestCase &t)
+        {
+            // advanceEeTimers only adds cycles until the next interrupt is due;
+            // a register read brings the timers up to date. Reading every
+            // COUNT after every step (so they are updated every step) must
+            // give the same interrupts, at the same steps, as never reading them.
+            constexpr uint32_t kTimerBases[] = {0x10000000u, 0x10000800u, 0x10001000u, 0x10001800u};
+            constexpr uint32_t kEquf = 1u << 10u;
+            constexpr uint32_t kOvff = 1u << 11u;
+            std::mt19937 random(20261025u);
+            const auto pick = [&](uint32_t limit) { return static_cast<uint32_t>(random() % limit); };
+            int mismatches = 0;
+            for (int round = 0; round < 40; ++round)
+            {
+                PS2Memory everyStep;
+                PS2Memory atEvents;
+                t.IsTrue(everyStep.initialize() && atEvents.initialize(), "PS2Memory initialize should succeed");
+                const auto write = [&](uint32_t address, uint32_t value)
+                {
+                    everyStep.writeIORegister(address, value);
+                    atEvents.writeIORegister(address, value);
+                };
+                const auto configure = [&](uint32_t base)
+                {
+                    write(base, pick(0x10000u));
+                    write(base + 0x20u, pick(4u) == 0u ? pick(16u) : pick(0x10000u));
+                    // CLKS, ZRET, CUE (mostly on), CMPE, OVFE, and clear both flags.
+                    const uint32_t mode = pick(4u) | (pick(2u) << 6u) | ((pick(5u) != 0u) << 7u) | (pick(2u) << 8u) |
+                                          (pick(2u) << 9u) | kEquf | kOvff;
+                    write(base + 0x10u, mode);
+                };
+                for (const uint32_t base : kTimerBases)
+                    configure(base);
+
+                for (int step = 0; step < 2000; ++step)
+                {
+                    const uint32_t kind = pick(100u);
+                    if (kind < 3u)
+                        configure(kTimerBases[pick(4u)]);
+                    else if (kind < 8u) // acknowledge: write the flags back as ones
+                    {
+                        const uint32_t base = kTimerBases[pick(4u)];
+                        write(base + 0x10u, everyStep.readIORegister(base + 0x10u) | kEquf | kOvff);
+                    }
+                    const uint64_t cycles = pick(50u) == 0u ? pick(600000u) : 1u + pick(pick(2u) ? 64u : 4096u);
+                    const uint32_t a = everyStep.advanceEeTimers(cycles);
+                    const uint32_t b = atEvents.advanceEeTimers(cycles);
+                    for (const uint32_t base : kTimerBases)
+                        (void)everyStep.readIORegister(base);
+                    if (a != b && mismatches++ < 5)
+                        t.Equals(b, a, "round " + std::to_string(round) + " step " + std::to_string(step) +
+                                           ": the same interrupts at the same step");
+                    if (pick(16u) == 0u)
+                    {
+                        const uint64_t until = everyStep.cyclesUntilNextEeTimerInterrupt();
+                        if (until != atEvents.cyclesUntilNextEeTimerInterrupt() && mismatches++ < 5)
+                            t.Equals(atEvents.cyclesUntilNextEeTimerInterrupt(), until,
+                                     "the same cycles until the next interrupt");
+                    }
+                }
+                for (const uint32_t base : kTimerBases)
+                {
+                    for (uint32_t offset = 0u; offset < 0x40u; offset += 0x10u)
+                    {
+                        if (everyStep.readIORegister(base + offset) != atEvents.readIORegister(base + offset) &&
+                            mismatches++ < 5)
+                            t.Equals(atEvents.readIORegister(base + offset), everyStep.readIORegister(base + offset),
+                                     "the same timer registers at the end");
+                    }
+                }
+            }
+            t.Equals(mismatches, 0, "no differences");
         });
 
         tc.Run("scratchpad alias accesses the same bytes as base", [](TestCase &t)
