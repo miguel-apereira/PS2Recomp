@@ -181,6 +181,23 @@ public:
     // Interrupts raised by devices since the last call, as cause bit masks
     // (INTC causes, DMAC channels). The EE scheduler dispatches them.
     uint32_t takePendingIntc() { return m_pendingIntc.exchange(0u, std::memory_order_acq_rel); }
+    // Raises INTC causes (a bit per cause) from any thread; the scheduler
+    // dispatches them at its next checkpoint.
+    void raisePendingIntc(uint32_t causes) { m_pendingIntc.fetch_or(causes, std::memory_order_acq_rel); }
+
+    // A host that runs VIF1 and VU1 on a thread of its own installs a hook
+    // that waits until that thread has nothing in progress. It is called
+    // before the EE side touches what that thread also uses: VU1 code and
+    // data memory, the GS privileged registers, the GIF registers, PATH3
+    // and GS downloads. The hook must return at once when called on the
+    // VU1 thread itself.
+    using GsSyncHook = std::function<void()>;
+    void setGsSyncHook(GsSyncHook hook) { m_gsSyncHook = std::move(hook); }
+    void syncGsAccess() const
+    {
+        if (m_gsSyncHook)
+            m_gsSyncHook();
+    }
     uint32_t takePendingDmac() { return m_pendingDmac.exchange(0u, std::memory_order_acq_rel); }
 
     using Vu1MscalCallback = std::function<void(uint32_t startPC, uint32_t top, uint32_t itop)>;
@@ -272,6 +289,7 @@ public:
     uint32_t m_ipuInWords[4] = {};
     uint32_t m_ipuOutWords[4] = {};
     std::atomic<uint32_t> m_pendingIntc{0};
+    GsSyncHook m_gsSyncHook;
     std::atomic<uint32_t> m_pendingDmac{0};
 
     void serviceIpu();
