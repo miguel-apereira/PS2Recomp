@@ -1980,6 +1980,47 @@ void register_ps2_memory_tests()
                 t.Equals(causes[0], 9u, "SPR_TO completion should use DMAC cause 9");
         });
 
+        tc.Run("DMAC SPR_TO and SPR_FROM reach VU0 data memory", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            // The Getaway copies VU0 output to the scratchpad from 0x11004800 with CHCR 0x140.
+            constexpr uint32_t kTo = 0x1000D400u;
+            constexpr uint32_t kFrom = 0x1000D000u;
+            constexpr uint32_t kVuOffset = 0x800u;
+            constexpr uint32_t kSadr = 0x2000u;
+            constexpr uint32_t kQwc = 3u;
+            constexpr uint32_t kBytes = kQwc * 16u;
+
+            for (uint32_t i = 0; i < kBytes; ++i)
+                mem.getVU0Data()[kVuOffset + i] = static_cast<uint8_t>(0x30u + i);
+
+            t.IsTrue(mem.writeIORegister(kTo + 0x10u, PS2_VU0_DATA_BASE + kVuOffset), "write SPR_TO MADR should succeed");
+            t.IsTrue(mem.writeIORegister(kTo + 0x20u, kQwc), "write SPR_TO QWC should succeed");
+            t.IsTrue(mem.writeIORegister(kTo + 0x80u, kSadr), "write SPR_TO SADR should succeed");
+            t.IsTrue(mem.writeIORegister(kTo + 0x00u, 0x140u), "start SPR_TO should succeed");
+
+            bool copied = true;
+            for (uint32_t i = 0; i < kBytes; ++i)
+                copied = copied && mem.getScratchpad()[kSadr + i] == static_cast<uint8_t>(0x30u + i);
+            t.IsTrue(copied, "SPR_TO should copy VU0 data memory to the scratchpad");
+            t.Equals(mem.readIORegister(kTo + 0x20u), 0u, "SPR_TO from VU0 memory should consume QWC");
+            t.IsTrue((mem.readIORegister(kTo + 0x00u) & 0x100u) == 0u, "SPR_TO from VU0 memory should clear CHCR.STR");
+
+            for (uint32_t i = 0; i < kBytes; ++i)
+                mem.getScratchpad()[kSadr + i] = static_cast<uint8_t>(0xA0u + i);
+            t.IsTrue(mem.writeIORegister(kFrom + 0x10u, PS2_VU0_DATA_BASE + 0xFF0u), "write SPR_FROM MADR should succeed");
+            t.IsTrue(mem.writeIORegister(kFrom + 0x20u, kQwc), "write SPR_FROM QWC should succeed");
+            t.IsTrue(mem.writeIORegister(kFrom + 0x80u, kSadr), "write SPR_FROM SADR should succeed");
+            t.IsTrue(mem.writeIORegister(kFrom + 0x00u, 0x100u), "start SPR_FROM should succeed");
+
+            bool wrapped = true;
+            for (uint32_t i = 0; i < kBytes; ++i)
+                wrapped = wrapped && mem.getVU0Data()[(0xFF0u + i) % PS2_VU0_DATA_SIZE] == static_cast<uint8_t>(0xA0u + i);
+            t.IsTrue(wrapped, "SPR_FROM should write VU0 data memory, wrapping at its end");
+        });
+
         tc.Run("sceDmaReset re-enables DMAC DMAE", [](TestCase &t)
         {
             PS2Runtime runtime;
