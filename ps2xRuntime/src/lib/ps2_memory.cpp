@@ -2563,7 +2563,9 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
             if ((address & 0xFF) == 0x00)
             {
                 // A host VIF runs its channel itself; STR stays set while the VIF stalls.
-                if ((m_vif[0] && address == 0x10008000u) || (m_vif[1] && address == 0x10009000u))
+                // So does channel 4 while a host IPU has no room for its data.
+                if ((m_vif[0] && address == 0x10008000u) || (m_vif[1] && address == 0x10009000u) ||
+                    (m_ipu && address == 0x1000B400u))
                 {
                     return m_ioRegisters[address];
                 }
@@ -2750,8 +2752,9 @@ void PS2Memory::clearModifiedFlag(uint32_t address, uint32_t size)
 }
 
 // DMA channels 3 (from IPU) and 4 (to IPU) in normal mode: a channel runs as
-// far as the IPU lets it, and finishes (CHCR.STR cleared, D_STAT.CIS set,
-// DMAC interrupt raised) once its QWC reaches zero.
+// far as the IPU lets it (its output, the room in its input FIFO), and
+// finishes (CHCR.STR cleared, D_STAT.CIS set, DMAC interrupt raised) once its
+// QWC reaches zero.
 void PS2Memory::serviceIpu()
 {
     if (!m_ipu)
@@ -2778,22 +2781,30 @@ void PS2Memory::serviceIpu()
     {
         progress = false;
 
-        // Channel 4: memory to the IPU input FIFO.
+        // Channel 4: memory to the IPU input FIFO, as fast as the IPU takes it.
         if (m_ioRegisters[0x1000B400u] & 0x100u)
         {
-            const uint32_t madr = m_ioRegisters[0x1000B410u];
-            const uint32_t qwc = m_ioRegisters[0x1000B420u] & 0xFFFFu;
-            if (qwc != 0u)
+            uint32_t &madrReg = m_ioRegisters[0x1000B410u];
+            uint32_t &qwcReg = m_ioRegisters[0x1000B420u];
+            for (uint32_t room; (qwcReg & 0xFFFFu) != 0u && (room = m_ipu->inputRoom()) != 0u;)
             {
-                if (const uint8_t *source = guestPointer(madr, qwc * 16u))
+                const uint32_t qwc = qwcReg & 0xFFFFu;
+                const uint8_t *source = guestPointer(madrReg, qwc * 16u);
+                // Unmapped source memory is skipped whole, as before.
+                const uint32_t count = source ? std::min(qwc, room) : qwc;
+                if (source)
                 {
-                    m_ipu->pushInput(source, qwc);
+                    m_ipu->pushInput(source, count);
                 }
-                m_ioRegisters[0x1000B410u] = madr + qwc * 16u;
-                m_ioRegisters[0x1000B420u] = 0u;
+                madrReg += count * 16u;
+                qwcReg = qwc - count;
+                progress = true;
             }
-            finish(0x1000B400u, 4u);
-            progress = true;
+            if ((qwcReg & 0xFFFFu) == 0u)
+            {
+                finish(0x1000B400u, 4u);
+                progress = true;
+            }
         }
 
         // Channel 3: the IPU output FIFO to memory.

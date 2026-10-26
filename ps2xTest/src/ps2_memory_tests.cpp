@@ -1,5 +1,6 @@
 #include "MiniTest.h"
 #include "runtime/ps2_memory.h"
+#include "runtime/ps2_ipu.h"
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/ps2_gs_psmct32.h"
 #include "ps2_runtime.h"
@@ -22,6 +23,56 @@ namespace
                (static_cast<uint32_t>(num) << 16) |
                static_cast<uint32_t>(imm);
     }
+
+    // An IPU with the PS2's 8-quadword input FIFO: command N (IPU_CMD) takes
+    // N quadwords, waiting (busy) for those that have not arrived.
+    class FifoIpu final : public PS2IpuDevice
+    {
+    public:
+        explicit FifoIpu(bool limited) : m_limited(limited) {}
+
+        void writeRegister(uint32_t offset, uint32_t value) override
+        {
+            if (offset == 0u)
+            {
+                m_wanted += value;
+                take();
+            }
+        }
+        uint32_t readRegister(uint32_t) override { return m_wanted != 0u ? 0x80000000u : 0u; }
+        void pushInput(const uint8_t *quadwords, uint32_t count) override
+        {
+            m_fifo.insert(m_fifo.end(), quadwords, quadwords + count * 16u);
+            take();
+        }
+        uint32_t inputRoom() const override
+        {
+            if (!m_limited)
+            {
+                return PS2IpuDevice::inputRoom();
+            }
+            const uint32_t held = static_cast<uint32_t>(m_fifo.size() / 16u);
+            return m_wanted != 0u ? m_wanted : (held < 8u ? 8u - held : 0u);
+        }
+        uint32_t outputAvailable() const override { return 0u; }
+        uint32_t popOutput(uint8_t *, uint32_t) override { return 0u; }
+        bool takeInterrupt() override { return false; }
+
+        std::vector<uint8_t> taken;
+
+    private:
+        void take()
+        {
+            const uint32_t count = std::min<uint32_t>(m_wanted, static_cast<uint32_t>(m_fifo.size() / 16u));
+            taken.insert(taken.end(), m_fifo.begin(), m_fifo.begin() + count * 16u);
+            m_fifo.erase(m_fifo.begin(), m_fifo.begin() + count * 16u);
+            m_wanted -= count;
+        }
+
+        bool m_limited;
+        uint32_t m_wanted = 0u;
+        std::vector<uint8_t> m_fifo;
+    };
 
     void setRegU32(R5900Context &ctx, int reg, uint32_t value)
     {
@@ -383,6 +434,54 @@ void register_ps2_memory_tests()
                 }
             }
             t.Equals(mismatches, 0, "no differences");
+        });
+
+        tc.Run("DMA to the IPU keeps pace with the IPU's input FIFO", [](TestCase &t)
+        {
+            constexpr uint32_t kSource = 0x00100000u;
+            constexpr uint32_t kChcr = 0x1000B400u;
+            constexpr uint32_t kMadr = 0x1000B410u;
+            constexpr uint32_t kQwc = 0x1000B420u;
+            constexpr uint32_t kDStat = 0x1000E010u;
+            for (const bool limited : {true, false})
+            {
+                PS2Memory mem;
+                t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+                FifoIpu ipu(limited);
+                mem.setIpuDevice(&ipu);
+                std::vector<uint8_t> source(64u * 16u);
+                for (size_t i = 0; i < source.size(); ++i)
+                {
+                    source[i] = static_cast<uint8_t>(i * 7u + i / 256u);
+                    mem.write8(kSource + static_cast<uint32_t>(i), source[i]);
+                }
+                mem.writeIORegister(kMadr, kSource);
+                mem.writeIORegister(kQwc, 64u);
+                mem.writeIORegister(kChcr, 0x100u);
+                if (!limited)
+                {
+                    // An IPU that does not say how much it takes gets it all at once.
+                    t.Equals(mem.readIORegister(kChcr) & 0x100u, 0u, "unlimited: the channel finishes at once");
+                    t.IsTrue((mem.readIORegister(kDStat) & (1u << 4u)) != 0u, "unlimited: D_STAT channel 4");
+                    continue;
+                }
+                // Idle: the FIFO fills, and the channel waits.
+                t.Equals(mem.readIORegister(kQwc) & 0xFFFFu, 56u, "8 quadwords fill the idle FIFO");
+                t.Equals(mem.readIORegister(kChcr) & 0x100u, 0x100u, "the channel still runs");
+                t.Equals(mem.readIORegister(kDStat) & (1u << 4u), 0u, "no interrupt yet");
+                t.Equals(mem.readIORegister(kMadr), kSource + 8u * 16u, "MADR follows the data sent");
+                // A command that takes 20: 8 from the FIFO, 12 sent while it waits, then 8 more fill it.
+                mem.writeIORegister(0x10002000u, 20u);
+                t.Equals(mem.readIORegister(kQwc) & 0xFFFFu, 36u, "the command's 12, and the FIFO again");
+                t.Equals(mem.readIORegister(kDStat) & (1u << 4u), 0u, "still no interrupt");
+                // A command that takes the rest finishes the channel.
+                mem.writeIORegister(0x10002000u, 44u);
+                t.Equals(mem.readIORegister(kQwc) & 0xFFFFu, 0u, "all sent");
+                t.Equals(mem.readIORegister(kChcr) & 0x100u, 0u, "the channel finishes once the IPU has its data");
+                t.IsTrue((mem.readIORegister(kDStat) & (1u << 4u)) != 0u, "D_STAT channel 4 then");
+                t.Equals(ipu.taken.size(), source.size(), "the IPU took all the data");
+                t.IsTrue(ipu.taken == source, "the IPU took the data in order");
+            }
         });
 
         tc.Run("scratchpad alias accesses the same bytes as base", [](TestCase &t)
