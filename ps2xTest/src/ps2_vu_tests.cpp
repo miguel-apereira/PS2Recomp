@@ -4,6 +4,7 @@
 #include "runtime/ps2_memory.h"
 #include "Kernel/Stubs/VU.h"
 
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -294,6 +295,49 @@ void register_ps2_vu_tests()
                 }
             }
             t.IsTrue(allMatch, "MulMatrix(dst, I, A) should equal A");
+        });
+
+        tc.Run("MulMatrix_and_ApplyMatrix_keep_PS2_max_a_number", [](TestCase &t)
+        {
+            // The PS2 has no NaN: 0x7FFFFFFF and 0xFFFFFFFF are +-max, and 0 * max is 0. A host multiply would
+            // make every lane that touches them a NaN.
+            const float max = std::bit_cast<float>(0x7FFFFFFFu);
+            const float negMax = std::bit_cast<float>(0xFFFFFFFFu);
+            VuEnv env;
+            float ident[16]{};
+            makeIdentity(ident);
+            float a[16] = {
+                1, 0, 0, 0,
+                0, 1, 0, 0,
+                0, 0, 1, 0,
+                negMax, 0, max, 1};
+            writeMat4(env, kA, a);
+            writeMat4(env, kB, ident);
+            SET_GPR_U32(&env.ctx, 4, kDst);
+            SET_GPR_U32(&env.ctx, 5, kA);
+            SET_GPR_U32(&env.ctx, 6, kB);
+            ps2_stubs::sceVu0MulMatrix(env.rdram.data(), &env.ctx, &env.runtime);
+            float out[16]{};
+            readMat4(env, kDst, out);
+            bool allMatch = true;
+            for (int i = 0; i < 16; ++i)
+            {
+                if (std::bit_cast<uint32_t>(out[i]) != std::bit_cast<uint32_t>(a[i]))
+                {
+                    allMatch = false;
+                }
+            }
+            t.IsTrue(allMatch, "MulMatrix(dst, A, I) should give A bit for bit, max entries included");
+
+            writeVec4(env, kC, 2.0f, 0.0f, 0.0f, 0.0f);
+            SET_GPR_U32(&env.ctx, 4, kOut);
+            SET_GPR_U32(&env.ctx, 5, kA);
+            SET_GPR_U32(&env.ctx, 6, kC);
+            ps2_stubs::sceVu0ApplyMatrix(env.rdram.data(), &env.ctx, &env.runtime);
+            float v[4]{};
+            readVec4f(env, kOut, v);
+            t.IsTrue(v[0] == 2.0f && v[1] == 0.0f && v[2] == 0.0f && v[3] == 0.0f,
+                     "ApplyMatrix with w = 0 should ignore a max translation row (0 * max = 0)");
         });
 
         tc.Run("MulMatrix_equals_arg2_times_arg1", [](TestCase &t)
