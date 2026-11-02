@@ -75,21 +75,26 @@ namespace ps2recomp
         uint8_t fs_reg = inst.rd;
         uint8_t ft_reg = inst.rt;
 
-        return fmt::format("{{ float fs = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); ctx->vu0_q = (ft != 0.0f) ? (fs / ft) : 0.0f; }}", fs_reg, fs_reg, fsf, ft_reg, ft_reg, ftf);
+        // x/0 gives +-max and sets D (I for 0/0), as on the VU.
+        return fmt::format("{{ float fs = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); ctx->vu0_q = ps2_vu0_div(ctx->vu0_status, fs, ft); }}", fs_reg, fs_reg, fsf, ft_reg, ft_reg, ftf);
     }
 
     std::string CodeGenerator::translateVU_VSQRT(const Instruction &inst)
     {
         uint8_t ftf = inst.vectorInfo.ftf;
         uint8_t ft_reg = inst.rt;
-        return fmt::format("{{ float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); ctx->vu0_q = sqrtf(std::max(0.0f, ft)); }}", ft_reg, ft_reg, ftf);
+        // sqrt(|ft|); a negative ft sets I.
+        return fmt::format("{{ float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); ctx->vu0_q = ps2_vu0_sqrt(ctx->vu0_status, ft); }}", ft_reg, ft_reg, ftf);
     }
 
     std::string CodeGenerator::translateVU_VRSQRT(const Instruction &inst)
     {
+        uint8_t fsf = inst.vectorInfo.fsf;
         uint8_t ftf = inst.vectorInfo.ftf;
+        uint8_t fs_reg = inst.rd;
         uint8_t ft_reg = inst.rt;
-        return fmt::format("{{ float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); ctx->vu0_q = (ft > 0.0f) ? (1.0f / sqrtf(ft)) : 0.0f; }}", ft_reg, ft_reg, ftf);
+        // fs / sqrt(|ft|), with the flags of DIV and SQRT.
+        return fmt::format("{{ float fs = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); float ft = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{}))); ctx->vu0_q = ps2_vu0_rsqrt(ctx->vu0_status, fs, ft); }}", fs_reg, fs_reg, fsf, ft_reg, ft_reg, ftf);
     }
 
     std::string CodeGenerator::translateVU_VMTIR(const Instruction &inst)
@@ -179,20 +184,9 @@ namespace ps2recomp
 
     std::string CodeGenerator::translateVU_VRNEXT(const Instruction &inst)
     {
-        return fmt::format(
-            "{{\n"
-            "    uint32_t r_vals[4];\n"
-            "    _mm_storeu_si128((__m128i*)r_vals, _mm_castps_si128(ctx->vu0_r));\n"
-            "\n"
-            "    // Simple LFSR-based random number generation (PS2-like behavior)\n"
-            "    uint32_t feedback = r_vals[0] ^ (r_vals[0] << 13) ^ (r_vals[1] >> 19) ^ (r_vals[2] << 7);\n"
-            "    r_vals[0] = r_vals[1];\n"
-            "    r_vals[1] = r_vals[2];\n"
-            "    r_vals[2] = r_vals[3];\n"
-            "    r_vals[3] = feedback;\n"
-            "\n"
-            "    ctx->vu0_r = _mm_castsi128_ps(_mm_loadu_si128((__m128i*)r_vals));\n"
-            "}}");
+        // Steps R and writes the new value to the dest lanes of ft.
+        uint8_t dest_mask = inst.vectorInfo.vectorField;
+        return fmt::format("{{ ctx->vu0_r = ps2_vu0_rnext(ctx->vu0_r); __m128i mask = _mm_set_epi32({}, {}, {}, {}); ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], ctx->vu0_r, _mm_castsi128_ps(mask)); }}", (dest_mask & 0x1) ? -1 : 0, (dest_mask & 0x2) ? -1 : 0, (dest_mask & 0x4) ? -1 : 0, (dest_mask & 0x8) ? -1 : 0, inst.rt, inst.rt);
     }
 
     std::string CodeGenerator::translateVU_VMADD_Field(const Instruction &inst)
@@ -246,7 +240,7 @@ namespace ps2recomp
 
         std::string shuffle_pattern = fmt::format("_MM_SHUFFLE({},{},{},{})", field, field, field, field);
 
-        return fmt::format("{{ __m128 res = _mm_min_ps(ctx->vu0_vf[{}], _mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], {})); "
+        return fmt::format("{{ __m128 res = ps2_vmin(ctx->vu0_vf[{}], _mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], {})); "
                            "__m128i mask = _mm_set_epi32({}, {}, {}, {}); "
                            "ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], res, _mm_castsi128_ps(mask)); }}",
                            vfs, vft, vft, shuffle_pattern,
@@ -265,7 +259,7 @@ namespace ps2recomp
 
         std::string shuffle_pattern = fmt::format("_MM_SHUFFLE({},{},{},{})", field, field, field, field);
 
-        return fmt::format("{{ __m128 res = _mm_max_ps(ctx->vu0_vf[{}], _mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], {})); "
+        return fmt::format("{{ __m128 res = ps2_vmax(ctx->vu0_vf[{}], _mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], {})); "
                            "__m128i mask = _mm_set_epi32({}, {}, {}, {}); "
                            "ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], res, _mm_castsi128_ps(mask)); }}",
                            vfs, vft, vft, shuffle_pattern,
@@ -326,7 +320,7 @@ namespace ps2recomp
         uint8_t vfs = inst.rd;
         uint8_t vft = inst.rt;
         uint8_t dest_mask = inst.vectorInfo.vectorField;
-        return fmt::format("{{ __m128 res = _mm_max_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}]); "
+        return fmt::format("{{ __m128 res = ps2_vmax(ctx->vu0_vf[{}], ctx->vu0_vf[{}]); "
                            "__m128i mask = _mm_set_epi32({}, {}, {}, {}); "
                            "ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], res, _mm_castsi128_ps(mask)); }}",
                            vfs, vft,
@@ -340,7 +334,7 @@ namespace ps2recomp
         uint8_t vfd = inst.sa;
         uint8_t vfs = inst.rd;
         uint8_t dest_mask = inst.vectorInfo.vectorField;
-        return fmt::format("{{ __m128 res = _mm_max_ps(ctx->vu0_vf[{}], _mm_set1_ps(ctx->vu0_i)); "
+        return fmt::format("{{ __m128 res = ps2_vmax(ctx->vu0_vf[{}], _mm_set1_ps(ctx->vu0_i)); "
                            "__m128i mask = _mm_set_epi32({}, {}, {}, {}); "
                            "ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], res, _mm_castsi128_ps(mask)); }}",
                            vfs,
@@ -354,7 +348,7 @@ namespace ps2recomp
         uint8_t vfd = inst.sa;
         uint8_t vfs = inst.rd;
         uint8_t dest_mask = inst.vectorInfo.vectorField;
-        return fmt::format("{{ __m128 res = _mm_min_ps(ctx->vu0_vf[{}], _mm_set1_ps(ctx->vu0_i)); "
+        return fmt::format("{{ __m128 res = ps2_vmin(ctx->vu0_vf[{}], _mm_set1_ps(ctx->vu0_i)); "
                            "__m128i mask = _mm_set_epi32({}, {}, {}, {}); "
                            "ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], res, _mm_castsi128_ps(mask)); }}",
                            vfs,
@@ -459,7 +453,7 @@ namespace ps2recomp
         uint8_t vfs = inst.rd;
         uint8_t vft = inst.rt;
         uint8_t dest_mask = inst.vectorInfo.vectorField;
-        return fmt::format("{{ __m128 res = _mm_min_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}]); "
+        return fmt::format("{{ __m128 res = ps2_vmin(ctx->vu0_vf[{}], ctx->vu0_vf[{}]); "
                            "__m128i mask = _mm_set_epi32({}, {}, {}, {}); "
                            "ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], res, _mm_castsi128_ps(mask)); }}",
                            vfs, vft,
@@ -754,9 +748,7 @@ namespace ps2recomp
         float scale = (shift == 0) ? 1.0f : static_cast<float>(1 << shift);
 
         return fmt::format("{{ __m128 src = ctx->vu0_vf[{}]; "
-                           "src = _mm_mul_ps(src, _mm_set1_ps({})); "
-                           "__m128i res_i = _mm_cvttps_epi32(src); "
-                           "__m128 res = _mm_castsi128_ps(res_i); "
+                           "__m128 res = _mm_castsi128_ps(ps2_vftoi(src, {})); "
                            "__m128i mask = _mm_set_epi32({}, {}, {}, {}); "
                            "ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], res, _mm_castsi128_ps(mask)); }}",
                            vfs, codegen::formatFloatLiteral(scale),
@@ -840,47 +832,16 @@ namespace ps2recomp
     {
         uint8_t fs_reg = inst.rd;
         uint8_t fsf = inst.vectorInfo.fsf;
-
-        return fmt::format(
-            "{{\n"
-            "    float src = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{})));\n"
-            "    uint32_t seed; std::memcpy(&seed, &src, sizeof(seed));\n"
-            "\n"
-            "    // PS2 uses a specific LFSR initialization pattern\n"
-            "    if (seed == 0) seed = 1;\n"
-            "\n"
-            "    uint32_t r0 = seed;\n"
-            "    uint32_t r1 = seed * 0x41C64E6D + 0x3039;\n"
-            "    uint32_t r2 = r1 * 0x41C64E6D + 0x3039;\n"
-            "    uint32_t r3 = r2 * 0x41C64E6D + 0x3039;\n"
-            "\n"
-            "    ctx->vu0_r = _mm_castsi128_ps(_mm_set_epi32(r3, r2, r1, r0));\n"
-            "}}",
-            fs_reg, fs_reg, fsf);
+        // R takes the 23 mantissa bits of fs.fsf.
+        return fmt::format("{{ __m128 src = _mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{})); ctx->vu0_r = _mm_castsi128_ps(_mm_set1_epi32(static_cast<int32_t>(ps2_vu0_r(src)))); }}", fs_reg, fs_reg, fsf);
     }
 
     std::string CodeGenerator::translateVU_VRXOR(const Instruction &inst)
     {
         uint8_t fs_reg = inst.rd;
         uint8_t fsf = inst.vectorInfo.fsf;
-
-        return fmt::format(
-            "{{\n"
-            "    float src = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{})));\n"
-            "    uint32_t src_bits; std::memcpy(&src_bits, &src, sizeof(src_bits));\n"
-            "    __m128i r_current = _mm_castps_si128(ctx->vu0_r);\n"
-            "    __m128i fs_data = _mm_set1_epi32((int)src_bits);\n"
-            "\n"
-            "    // XOR the current random value with the data from the VU vector register\n"
-            "    __m128i xored = _mm_xor_si128(r_current, fs_data);\n"
-            "\n"
-            "    // Apply a simple mixing function similar to PS2's LFSR\n"
-            "    __m128i mixed = _mm_xor_si128(xored, _mm_slli_epi32(xored, 7));\n"
-            "    mixed = _mm_xor_si128(mixed, _mm_srli_epi32(mixed, 9));\n"
-            "\n"
-            "    ctx->vu0_r = _mm_castsi128_ps(mixed);\n"
-            "}}",
-            fs_reg, fs_reg, fsf);
+        // R's 23 bits are xored with the mantissa bits of fs.fsf.
+        return fmt::format("{{ __m128 src = _mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], _MM_SHUFFLE(0,0,0,{})); ctx->vu0_r = _mm_castsi128_ps(_mm_set1_epi32(static_cast<int32_t>(ps2_vu0_r(_mm_xor_ps(ctx->vu0_r, src))))); }}", fs_reg, fs_reg, fsf);
     }
 
 }

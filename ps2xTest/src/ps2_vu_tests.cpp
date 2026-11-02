@@ -1086,4 +1086,99 @@ void register_ps2_vu_tests()
             t.IsTrue(nearlyEqual(out[0], 0.0f), "DropShadowMatrix point mode should subtract d before scaling by k");
         });
     });
+
+    MiniTest::Case("PS2VU0MacroRules", [](TestCase &tc)
+    {
+        auto bits = [](float f) { return std::bit_cast<uint32_t>(f); };
+        auto fromBits = [](uint32_t b) { return std::bit_cast<float>(b); };
+        auto lanes = [](__m128 v, uint32_t (&out)[4]) { _mm_storeu_si128(reinterpret_cast<__m128i *>(out), _mm_castps_si128(v)); };
+
+        tc.Run("FMAC flags report zero, sign and overflow per written lane, x in the high bit", [=](TestCase &t)
+        {
+            uint32_t mac = 0xFFFFu;
+            uint16_t status = 0x0100u; // an older sticky U
+            // x = -3, y = 0, z = +max, w = 2
+            const __m128 r = _mm_setr_ps(-3.0f, 0.0f, fromBits(0x7FFFFFFFu), 2.0f);
+            ps2_vu0_fmac_flags(mac, status, r, 0xF);
+            t.Equals(mac, 0x2084u, "MAC: Z on y (bit 2), S on x (bit 7), O on z (bit 13)");
+            t.Equals(static_cast<uint32_t>(status), 0x0100u | 0x0Bu | (0x0Bu << 6), "status: Z S O now and sticky, older sticky kept");
+
+            ps2_vu0_fmac_flags(mac, status, r, 0x1); // only w written
+            t.Equals(mac, 0u, "a lane the operation does not write reads 0");
+            t.Equals(static_cast<uint32_t>(status & 0xFu), 0u, "current status bits follow the written lanes only");
+
+            mac = 0x1234u;
+            ps2_vu0_fmac_flags(mac, status, r, 0x0);
+            t.Equals(mac, 0x1234u, "no dest lanes leave the flags alone");
+        });
+
+        tc.Run("DIV, SQRT and RSQRT give PS2 results and set I and D", [=](TestCase &t)
+        {
+            uint16_t status = 0;
+            t.Equals(bits(ps2_vu0_div(status, 3.0f, 0.0f)), 0x7FFFFFFFu, "x/0 is +max");
+            t.Equals(static_cast<uint32_t>(status), 0x20u | 0x800u, "x/0 sets D and its sticky copy");
+            t.Equals(bits(ps2_vu0_div(status, -3.0f, 0.0f)), 0xFFFFFFFFu, "-x/0 is -max");
+            t.Equals(bits(ps2_vu0_div(status, 0.0f, 0.0f)), 0x7FFFFFFFu, "0/0 is max as well");
+            t.Equals(static_cast<uint32_t>(status), 0x10u | 0x400u | 0x800u, "0/0 sets I; the sticky D stays");
+            t.IsTrue(ps2_vu0_div(status, 1.0f, 4.0f) == 0.25f, "an ordinary division");
+            t.Equals(static_cast<uint32_t>(status & 0x30u), 0u, "an ordinary division clears the current I and D");
+
+            status = 0;
+            t.IsTrue(ps2_vu0_sqrt(status, -16.0f) == 4.0f, "SQRT takes |ft|");
+            t.Equals(static_cast<uint32_t>(status), 0x10u | 0x400u, "a negative SQRT operand sets I");
+            t.IsTrue(ps2_vu0_rsqrt(status, 1.0f, 16.0f) == 0.25f, "RSQRT is fs / sqrt(ft), not 1 / sqrt(ft)");
+            t.IsTrue(ps2_vu0_rsqrt(status, 2.0f, -4.0f) == 1.0f, "RSQRT takes |ft|");
+            t.Equals(bits(ps2_vu0_rsqrt(status, -2.0f, 0.0f)), 0xFFFFFFFFu, "RSQRT by 0 is max with the sign of fs");
+            t.Equals(static_cast<uint32_t>(status & 0x30u), 0x20u, "RSQRT by 0 sets D");
+        });
+
+        tc.Run("MAX and MINI order exponent-255 values as numbers", [=](TestCase &t)
+        {
+            const __m128 a = _mm_setr_ps(fromBits(0x7FFFFFFFu), fromBits(0xFFFFFFFFu), -1.0f, 0.0f);
+            const __m128 b = _mm_setr_ps(1.0f, -2.0f, fromBits(0x7F800001u), fromBits(0x80000000u));
+            uint32_t mx[4], mn[4];
+            lanes(ps2_vmax(a, b), mx);
+            lanes(ps2_vmin(a, b), mn);
+            t.Equals(mx[0], 0x7FFFFFFFu, "max(+max, 1) = +max");
+            t.Equals(mx[1], bits(-2.0f), "max(-max, -2) = -2");
+            t.Equals(mx[2], 0x7F800001u, "max(-1, 2^128) = 2^128");
+            t.Equals(mx[3], 0u, "max(+0, -0) = +0");
+            t.Equals(mn[0], bits(1.0f), "min(+max, 1) = 1");
+            t.Equals(mn[1], 0xFFFFFFFFu, "min(-max, -2) = -max");
+            t.Equals(mn[2], bits(-1.0f), "min(-1, 2^128) = -1");
+            t.Equals(mn[3], 0x80000000u, "min(+0, -0) = -0");
+            t.Equals(bits(ps2_fmax(fromBits(0x7FFFFFFFu), 1.0f)), 0x7FFFFFFFu, "FPU MAX.S keeps max a number");
+            t.Equals(bits(ps2_fmin(fromBits(0xFFFFFFFFu), 1.0f)), 0xFFFFFFFFu, "FPU MIN.S keeps -max a number");
+        });
+
+        tc.Run("FTOI saturates by sign", [=](TestCase &t)
+        {
+            uint32_t r[4];
+            lanes(_mm_castsi128_ps(ps2_vftoi(_mm_setr_ps(3e9f, -3e9f, fromBits(0x7FFFFFFFu), -2.75f), 1.0f)), r);
+            t.Equals(r[0], 0x7FFFFFFFu, "a large positive value gives 0x7FFFFFFF");
+            t.Equals(r[1], 0x80000000u, "a large negative value gives 0x80000000");
+            t.Equals(r[2], 0x7FFFFFFFu, "+max gives 0x7FFFFFFF");
+            t.Equals(r[3], static_cast<uint32_t>(-2), "rounding is toward zero");
+            lanes(_mm_castsi128_ps(ps2_vftoi(_mm_setr_ps(1.5f, 0.0f, 0.0f, 0.0f), 16.0f)), r);
+            t.Equals(r[0], 24u, "FTOI4 scales by 16");
+        });
+
+        tc.Run("CLIP sets +x in bit 0 and -x in bit 1 against |w|", [=](TestCase &t)
+        {
+            const __m128 fs = _mm_setr_ps(5.0f, -5.0f, 1.0f, 0.0f);
+            t.Equals(ps2_vclip(fs, _mm_setr_ps(0.0f, 0.0f, 0.0f, -2.0f)), 0x01u | 0x08u, "x > |w| is bit 0, y < -|w| is bit 3");
+            t.Equals(ps2_vclip(_mm_setr_ps(fromBits(0x7FFFFFFFu), 0.0f, 0.0f, 0.0f), _mm_setr_ps(0.0f, 0.0f, 0.0f, 1.0f)), 0x01u,
+                     "+max is outside the +x plane");
+        });
+
+        tc.Run("R register steps like the VU's", [=](TestCase &t)
+        {
+            __m128 r = _mm_castsi128_ps(_mm_set1_epi32(0x3F800010)); // bit 4 set
+            r = ps2_vu0_rnext(r);
+            uint32_t l[4];
+            lanes(r, l);
+            t.Equals(l[0], 0x3F800021u, "shift left and feed back bit 4 xor bit 22");
+            t.Equals(l[3], l[0], "R is kept in all four lanes");
+        });
+    });
 }

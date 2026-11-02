@@ -2147,33 +2147,89 @@ void register_code_generator_tests()
                      "jalr fallback should not dispatch directly to tail-jump delay slot");
         });
 
-        tc.Run("VU random helpers emit line comments on separate lines", [](TestCase &t) {
+        tc.Run("VU random helpers emit plain statements", [](TestCase &t) {
             CodeGenerator gen({}, {});
 
             Instruction inst{};
             inst.rd = 7;
+            inst.rt = 3;
             inst.vectorInfo.fsf = 2;
+            inst.vectorInfo.vectorField = 0xF;
 
-            std::string vrnext = gen.translateVU_VRNEXT(inst);
-            printGeneratedCode("VU random helpers emit line comments on separate lines - VRNEXT", vrnext);
-            t.IsTrue(vrnext.find("// Simple LFSR-based random number generation (PS2-like behavior)\n"
-                                 "    uint32_t feedback") != std::string::npos,
-                     "VRNEXT should place the generated line comment on its own line");
+            for (const std::string &code : {gen.translateVU_VRNEXT(inst), gen.translateVU_VRINIT(inst), gen.translateVU_VRXOR(inst)})
+            {
+                t.IsTrue(code.find("//") == std::string::npos, "no line comment that could swallow the code after it");
+            }
+            t.IsTrue(gen.translateVU_VRNEXT(inst).find("ctx->vu0_vf[3] =") != std::string::npos, "VRNEXT writes its result to ft");
+        });
 
-            std::string vrinit = gen.translateVU_VRINIT(inst);
-            printGeneratedCode("VU random helpers emit line comments on separate lines - VRINIT", vrinit);
-            t.IsTrue(vrinit.find("// PS2 uses a specific LFSR initialization pattern\n"
-                                 "    if (seed == 0) seed = 1;") != std::string::npos,
-                     "VRINIT should place the generated line comment on its own line");
+        tc.Run("VU0 macro writes to vf0 are undone and FMAC operations set the flags", [](TestCase &t) {
+            CodeGenerator gen({}, {});
+            const std::string restore = "ctx->vu0_vf[0] = _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f);";
 
-            std::string vrxor = gen.translateVU_VRXOR(inst);
-            printGeneratedCode("VU random helpers emit line comments on separate lines - VRXOR", vrxor);
-            t.IsTrue(vrxor.find("// XOR the current random value with the data from the VU vector register\n"
-                                "    __m128i xored") != std::string::npos,
-                     "VRXOR should keep the XOR comment on its own line");
-            t.IsTrue(vrxor.find("// Apply a simple mixing function similar to PS2's LFSR\n"
-                                "    __m128i mixed") != std::string::npos,
-                     "VRXOR should keep the LFSR comment on its own line");
+            // VADDx.xyzw vf0, vf10, vf0x: the game runs this only for the flags.
+            Instruction add{};
+            add.opcode = OPCODE_COP2;
+            add.rs = COP2_CO;
+            add.function = VU0_S1_VADDx;
+            add.sa = 0;
+            add.rd = 10;
+            add.rt = 0;
+            add.vectorInfo.vectorField = 0xF;
+            std::string out = gen.translateInstruction(add);
+            const size_t flags = out.find("ps2_vu0_fmac_flags(ctx->vu0_mac_flags, ctx->vu0_status, ctx->vu0_vf[0], 15);");
+            const size_t undo = out.find(restore);
+            t.IsTrue(flags != std::string::npos, "VADDx sets the flags from its result");
+            t.IsTrue(undo != std::string::npos && undo > flags, "vf0 is put back after the flags are read from it");
+
+            add.sa = 4;
+            out = gen.translateInstruction(add);
+            t.IsTrue(out.find(restore) == std::string::npos, "a write to another register leaves vf0 alone");
+            t.IsTrue(out.find("ctx->vu0_vf[4], 15);") != std::string::npos, "flags come from the register written");
+
+            Instruction mula{};
+            mula.opcode = OPCODE_COP2;
+            mula.rs = COP2_CO;
+            mula.function = 0x3C; // Special2 table
+            mula.raw = (static_cast<uint32_t>(VU0_S2_VMULAx >> 2) << 6) | (VU0_S2_VMULAx & 0x3u) | 0x3Cu;
+            mula.vectorInfo.vectorField = 0x8;
+            out = gen.translateInstruction(mula);
+            t.IsTrue(out.find("ps2_vu0_fmac_flags(ctx->vu0_mac_flags, ctx->vu0_status, ctx->vu0_acc, 8);") != std::string::npos,
+                     "an ACC operation sets the flags from ACC");
+
+            Instruction move{};
+            move.opcode = OPCODE_COP2;
+            move.rs = COP2_CO;
+            move.function = 0x3C;
+            move.raw = (static_cast<uint32_t>(VU0_S2_VMOVE >> 2) << 6) | (VU0_S2_VMOVE & 0x3u) | 0x3Cu;
+            move.rt = 0;
+            move.rd = 5;
+            move.vectorInfo.vectorField = 0xF;
+            out = gen.translateInstruction(move);
+            t.IsTrue(out.find(restore) != std::string::npos, "VMOVE to vf0 is undone");
+            t.IsTrue(out.find("ps2_vu0_fmac_flags") == std::string::npos, "VMOVE does not touch the flags");
+
+            Instruction qmtc2{};
+            qmtc2.opcode = OPCODE_COP2;
+            qmtc2.rs = COP2_QMTC2;
+            qmtc2.rt = 8;
+            qmtc2.rd = 0;
+            t.IsTrue(gen.translateInstruction(qmtc2).find(restore) != std::string::npos, "QMTC2 to vf0 is undone");
+        });
+
+        tc.Run("MOVZ and MOVN move 64 bits", [](TestCase &t) {
+            CodeGenerator gen({}, {});
+            Instruction inst{};
+            inst.opcode = OPCODE_SPECIAL;
+            inst.function = SPECIAL_MOVZ;
+            inst.rd = 2;
+            inst.rs = 3;
+            inst.rt = 4;
+            std::string out = gen.translateInstruction(inst);
+            t.IsTrue(out.find("SET_GPR_U64(ctx, 2, GPR_U64(ctx, 3))") != std::string::npos, "MOVZ writes the low 64 bits only");
+            inst.function = SPECIAL_MOVN;
+            out = gen.translateInstruction(inst);
+            t.IsTrue(out.find("SET_GPR_U64(ctx, 2, GPR_U64(ctx, 3))") != std::string::npos, "MOVN writes the low 64 bits only");
         });
 
         tc.Run("resolveStubTarget allows leading underscore alias", [](TestCase &t) {
