@@ -147,8 +147,9 @@ static inline uint32_t ps2_plzcw32(uint32_t x)
 //   - x/0 gives +-0x7FFFFFFF.
 // A host float cannot hold the exponent-255 values, so anything that touches them is computed in double.
 // That path is rare and kept out of line; the inline part is the host operation and a range check.
-// One case is left to the host: ADD.S/SUB.S/MUL.S and the vector operations do not look for an operand with
-// exponent 0 and a non-zero mantissa, so it takes part with its tiny host value instead of as zero.
+// ADD.S/SUB.S/MUL.S and the vector operations do not look for an operand with exponent 0 and a non-zero
+// mantissa themselves: the game thread runs with the host's denormals-are-zero mode, which reads it as zero.
+// The rounding is the host's too, and the game thread sets it toward zero like the EE.
 // Checked against the hardware results in ps2autotests (tests/cpu/ee_fpu).
 #if defined(_MSC_VER)
 #define PS2_FLOAT_NOINLINE __declspec(noinline)
@@ -386,6 +387,133 @@ inline __m128 ps2_vsub(__m128 a, __m128 b)
 inline __m128 ps2_vmul(__m128 a, __m128 b)
 {
     return ps2_vfinish(a, b, _mm_mul_ps(a, b), Ps2VecOp::Mul);
+}
+
+// VU0 macro mode beyond the plain arithmetic: flags, Q, MAX/MINI, FTOI, CLIP and the R register, following the
+// rules VuCore uses for the same VU instructions.
+
+// The MAC and status flags of an FMAC operation (ADD, SUB, MUL, MADD, MSUB, OPMULA, OPMSUB and their ACC
+// forms) from its result r. The MAC flag holds, for each lane the operation writes, zero in bits 0-3, sign in
+// 4-7, underflow in 8-11 and overflow in 12-15, x in the highest bit of each group as in the dest field; lanes
+// it does not write read 0. The status flag gets their OR as Z, S, U and O (bits 0-3) and adds them to the
+// sticky copies (bits 6-9). An operation with no lanes leaves both alone.
+// The result is read as written: zero is exponent 0, overflow is the largest value an overflow saturates to.
+// An underflow cannot be told apart from an exact zero there, so U is never set.
+inline void ps2_vu0_fmac_flags(uint32_t &mac, uint16_t &status, __m128 r, uint32_t dest)
+{
+    if (dest == 0u)
+        return;
+    // movemask puts x in bit 0; the VU puts it in bit 3.
+    static constexpr uint8_t kReverse[16] = {0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15};
+    const __m128i bits = _mm_castps_si128(r);
+    const __m128i exponent = _mm_and_si128(bits, _mm_set1_epi32(0x7F800000));
+    const __m128i magnitude = _mm_and_si128(bits, _mm_set1_epi32(0x7FFFFFFF));
+    const uint32_t zero = kReverse[_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(exponent, _mm_setzero_si128())))] & dest;
+    const uint32_t sign = kReverse[_mm_movemask_ps(r)] & dest;
+    const uint32_t over = kReverse[_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(magnitude, _mm_set1_epi32(0x7FFFFFFF))))] & dest;
+    mac = zero | (sign << 4) | (over << 12);
+    const uint32_t current = (zero ? 0x1u : 0u) | (sign ? 0x2u : 0u) | (over ? 0x8u : 0u);
+    status = static_cast<uint16_t>((status & 0xFF0u) | current | (current << 6));
+}
+
+// The status flag after a DIV, SQRT or RSQRT: I (bit 4) for 0/0 or a negative root, D (bit 5) for x/0 with any
+// other x, both added to their sticky copies (bits 10, 11).
+inline void ps2_vu0_set_di(uint16_t &status, uint32_t di)
+{
+    status = static_cast<uint16_t>((status & 0xFCFu) | di | (di << 6));
+}
+
+inline float ps2_vu0_div(uint16_t &status, float fs, float ft)
+{
+    const bool zeroFs = (std::bit_cast<uint32_t>(fs) & PS2_FLOAT_EXP_MASK) == 0u;
+    const bool zeroFt = (std::bit_cast<uint32_t>(ft) & PS2_FLOAT_EXP_MASK) == 0u;
+    ps2_vu0_set_di(status, zeroFt ? (zeroFs ? 0x10u : 0x20u) : 0u);
+    return ps2_fdiv(fs, ft);
+}
+
+inline float ps2_vu0_sqrt(uint16_t &status, float ft)
+{
+    const uint32_t b = std::bit_cast<uint32_t>(ft);
+    ps2_vu0_set_di(status, ((b & PS2_FLOAT_SIGN_MASK) && (b & PS2_FLOAT_EXP_MASK)) ? 0x10u : 0u);
+    return ps2_fsqrt(ft);
+}
+
+inline float ps2_vu0_rsqrt(uint16_t &status, float fs, float ft)
+{
+    const uint32_t b = std::bit_cast<uint32_t>(ft);
+    uint32_t di = (b & PS2_FLOAT_SIGN_MASK) && (b & PS2_FLOAT_EXP_MASK) ? 0x10u : 0u;
+    if ((b & PS2_FLOAT_EXP_MASK) == 0u)
+        di = (std::bit_cast<uint32_t>(fs) & PS2_FLOAT_EXP_MASK) == 0u ? 0x10u : 0x20u;
+    ps2_vu0_set_di(status, di);
+    return ps2_frsqrt(fs, ft);
+}
+
+// MAX and MINI order the lanes as sign and magnitude integers, so exponent 255 is an ordinary number and there
+// is no NaN; the result is one of the operands, bit for bit. -0 orders below +0.
+inline __m128i ps2_vorder_key(__m128 v)
+{
+    const __m128i b = _mm_castps_si128(v);
+    return _mm_xor_si128(b, _mm_and_si128(_mm_srai_epi32(b, 31), _mm_set1_epi32(0x7FFFFFFF)));
+}
+
+inline __m128 ps2_vmax(__m128 a, __m128 b)
+{
+    return _mm_blendv_ps(b, a, _mm_castsi128_ps(_mm_cmpgt_epi32(ps2_vorder_key(a), ps2_vorder_key(b))));
+}
+
+inline __m128 ps2_vmin(__m128 a, __m128 b)
+{
+    return _mm_blendv_ps(b, a, _mm_castsi128_ps(_mm_cmpgt_epi32(ps2_vorder_key(b), ps2_vorder_key(a))));
+}
+
+// MAX.S and MIN.S of the EE FPU, in the order the FPU compares use.
+inline float ps2_fmax(float a, float b)
+{
+    return ps2_fcmp_key(a) >= ps2_fcmp_key(b) ? a : b;
+}
+
+inline float ps2_fmin(float a, float b)
+{
+    return ps2_fcmp_key(a) <= ps2_fcmp_key(b) ? a : b;
+}
+
+// FTOI0/4/12/15: v * scale (2^0, 2^4, 2^12 or 2^15) rounded toward zero, saturating to 0x7FFFFFFF or
+// 0x80000000 by the sign of v. Out of range is found from the bits of v, exponent 255 included, rather than
+// from what the host conversion returns for it, which a compiler may fold differently.
+inline __m128i ps2_vftoi(__m128 v, float scale)
+{
+    const __m128i b = _mm_castps_si128(v);
+    const int32_t limit = 0x4F000000 - (std::bit_cast<int32_t>(scale) - 0x3F800000); // 2^31 / scale
+    const __m128i outOfRange = _mm_cmpgt_epi32(_mm_and_si128(b, _mm_set1_epi32(0x7FFFFFFF)), _mm_set1_epi32(limit - 1));
+    const __m128i saturated = _mm_xor_si128(_mm_set1_epi32(INT32_MAX), _mm_srai_epi32(b, 31));
+    const __m128i r = _mm_cvttps_epi32(_mm_mul_ps(v, _mm_set1_ps(scale)));
+    return _mm_castps_si128(_mm_blendv_ps(_mm_castsi128_ps(r), _mm_castsi128_ps(saturated), _mm_castsi128_ps(outOfRange)));
+}
+
+// CLIP: the six new clip bits for x, y, z of fs against |ft.w|, in the order +x -x +y -y +z -z. The compare is
+// on sign and magnitude integers; a w with exponent 0 lets every value with exponent 0 through.
+inline uint32_t ps2_vclip(__m128 fs, __m128 ft)
+{
+    const uint32_t w = static_cast<uint32_t>(_mm_cvtsi128_si32(_mm_shuffle_epi32(_mm_castps_si128(ft), _MM_SHUFFLE(3, 3, 3, 3))));
+    const __m128i limit = _mm_set1_epi32((w & PS2_FLOAT_EXP_MASK) ? static_cast<int32_t>(w & 0x7FFFFFFFu) : 0x007FFFFF);
+    const __m128i b = _mm_castps_si128(fs);
+    const uint32_t pos = static_cast<uint32_t>(_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpgt_epi32(b, limit))));
+    const uint32_t neg = static_cast<uint32_t>(_mm_movemask_ps(_mm_castsi128_ps(
+        _mm_cmpgt_epi32(_mm_xor_si128(b, _mm_set1_epi32(INT32_MIN)), limit))));
+    return (pos & 1u) | ((neg & 1u) << 1) | ((pos & 2u) << 1) | ((neg & 2u) << 2) | ((pos & 4u) << 2) | ((neg & 4u) << 3);
+}
+
+// The R register: 23 random bits under the exponent of 1.0, kept in all four lanes of vu0_r.
+inline uint32_t ps2_vu0_r(__m128 r)
+{
+    return 0x3F800000u | (static_cast<uint32_t>(_mm_cvtsi128_si32(_mm_castps_si128(r))) & 0x007FFFFFu);
+}
+
+inline __m128 ps2_vu0_rnext(__m128 r)
+{
+    const uint32_t bits = ps2_vu0_r(r);
+    const uint32_t next = 0x3F800000u | (((bits << 1) ^ ((bits >> 4) & 1u) ^ ((bits >> 22) & 1u)) & 0x007FFFFFu);
+    return _mm_castsi128_ps(_mm_set1_epi32(static_cast<int32_t>(next)));
 }
 
 // PS2 VU (Vector Unit) operations

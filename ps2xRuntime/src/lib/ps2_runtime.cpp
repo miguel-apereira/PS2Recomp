@@ -196,6 +196,20 @@ namespace
         return tlbRefill ? EXCEPTION_VECTOR_TLB_REFILL : EXCEPTION_VECTOR_GENERAL;
     }
 
+    // The EE FPU and VU0 round toward zero and have no denormals: an operand with exponent 0 is zero and a
+    // result below the smallest normal becomes zero. The thread that runs the game uses the same host mode
+    // (MXCSR round toward zero, flush to zero, denormals are zero), so the host float operations in the game
+    // code give the PS2 results. Threads that run VU1 work for the game copy this mode from it.
+    void setGuestFloatMode()
+    {
+#if defined(_M_X64) || defined(__x86_64__) || defined(_M_IX86) || defined(__i386__)
+        constexpr uint32_t kRoundTowardZero = 0x6000u;
+        constexpr uint32_t kFlushToZero = 0x8000u;
+        constexpr uint32_t kDenormalsAreZero = 0x0040u;
+        _mm_setcsr(_mm_getcsr() | kRoundTowardZero | kFlushToZero | kDenormalsAreZero);
+#endif
+    }
+
     void seedVu0IdleSuccess(R5900Context *ctx)
     {
         if (!ctx)
@@ -2529,6 +2543,7 @@ void PS2Runtime::startGuest()
     m_guestThread = std::thread([this]()
                            {
         ThreadNaming::SetCurrentThreadName("GameThread");
+        setGuestFloatMode();
         try
         {
             m_eeScheduler->reset(m_memory.getRDRAM(), m_cpuContext);
