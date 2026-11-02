@@ -75,6 +75,7 @@ namespace
     constexpr uint32_t kVu0WaitPc = 0x00160600u;
     constexpr uint32_t kVu0ResumePc = 0x00160610u;
     constexpr uint32_t kVu0HandlerPc = 0x00160620u;
+    constexpr uint32_t kSlowHostPc = 0x00160700u;
 
     constexpr uint32_t kTimer2Count = 0x10001000u;
     constexpr uint32_t kTimer2Mode = 0x10001010u;
@@ -152,6 +153,40 @@ namespace
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
         return pred();
+    }
+
+    // A guest loop on a host far slower than the PS2: each pass costs a
+    // few EE cycles and 2 ms of host time.
+    std::chrono::steady_clock::time_point g_slowHostStart{};
+    uint64_t g_slowHostTicks = 0u;
+    std::chrono::milliseconds g_slowHostElapsed{};
+
+    void slowHostLoop(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        g_slowHostTicks = runtime->eeScheduler().currentVSyncTick();
+        g_slowHostElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - g_slowHostStart);
+        if (g_slowHostTicks >= 6u || g_slowHostElapsed >= std::chrono::milliseconds(250))
+        {
+            ctx->pc = 0u;
+            runtime->requestStop();
+            return;
+        }
+        ctx->pc = kSlowHostPc;
+    }
+
+    void runSlowHost(TestEnv &env, bool catchUp)
+    {
+        env.runtime.registerFunction(kSlowHostPc, slowHostLoop);
+        g_slowHostTicks = 0u;
+        R5900Context mainContext{};
+        mainContext.pc = kSlowHostPc;
+        EeScheduler &scheduler = env.runtime.eeScheduler();
+        scheduler.reset(env.rdram.data(), mainContext);
+        scheduler.setVBlankCatchUp(catchUp);
+        g_slowHostStart = std::chrono::steady_clock::now();
+        scheduler.run();
     }
 
     void cleanupRuntime(TestEnv &env)
@@ -558,6 +593,28 @@ void register_ps2_runtime_interrupt_tests()
             t.Equals(g_resumedResult, 0, "the first VBlank field should return even-field parity");
             t.Equals(g_vsyncCsr & 0x2000ull, 0x2000ull,
                      "the first VBlank should publish GS CSR.FIELD before resuming guest code");
+        });
+
+        tc.Run("VBlank waits for EE cycles when catch-up is off (slow host = slow motion)", [](TestCase &t)
+        {
+            TestEnv env;
+            runSlowHost(env, false);
+            t.Equals(g_slowHostTicks, 0ull, "no VBlank should fire before the EE runs its cycles");
+        });
+
+        tc.Run("VBlank catch-up keeps host time when the EE falls behind", [](TestCase &t)
+        {
+            TestEnv env;
+            runSlowHost(env, true);
+            const EeScheduler::VBlankCatchUpStats stats = env.runtime.eeScheduler().takeVBlankCatchUpStats();
+            t.Equals(g_slowHostTicks, 6ull, "VBlanks should follow host time");
+            // 6 VBlanks take 100 ms of host time; allow for a slow test machine.
+            t.IsTrue(g_slowHostElapsed >= std::chrono::milliseconds(90) &&
+                         g_slowHostElapsed < std::chrono::milliseconds(250),
+                     "VBlanks should not run ahead of host time");
+            t.IsTrue(stats.caughtUp >= 5u, "the VBlanks should be counted as caught up");
+            t.IsTrue(stats.skippedCycles > 5u * 4000000u, "the EE should skip ahead about a VBlank of cycles each time");
+            t.Equals(stats.dropped, 0ull, "nothing should be dropped this close to host time");
         });
 
         tc.Run("VBlank IRQ invocation completes before the resumed base context", [](TestCase &t)

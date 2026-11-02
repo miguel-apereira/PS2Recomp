@@ -284,6 +284,22 @@ public:
     // EE cycles accounted so far (COP0 Count runs from these).
     [[nodiscard]] uint64_t eeCycle() const noexcept { return m_eeCycle; }
 
+    // VBlank catch-up. Off: a VBlank waits for both its host time and its
+    // EE cycles, so an EE that runs slower than the PS2 runs the game in
+    // slow motion. On: once a VBlank's host time has passed, the EE cycle
+    // count jumps to it and it fires, so a slow host drops frames instead
+    // and the game keeps real time. Set before run().
+    void setVBlankCatchUp(bool enabled) noexcept { m_vblankCatchUp = enabled; }
+    [[nodiscard]] bool vblankCatchUp() const noexcept { return m_vblankCatchUp; }
+    struct VBlankCatchUpStats
+    {
+        uint64_t caughtUp = 0;  // VBlanks fired before the EE reached their cycles
+        uint64_t skippedCycles = 0; // EE cycles skipped to reach them
+        uint64_t dropped = 0;   // VBlanks dropped because the host fell too far behind
+    };
+    // Counts since the last call.
+    [[nodiscard]] VBlankCatchUpStats takeVBlankCatchUpStats() noexcept;
+
     // Kernel object API. All calls except postEvent/requestStop execute on the
     // EE executor and therefore need no host synchronization.
     void setupCurrentThread(uint32_t stack, uint32_t stackSize, uint32_t gp);
@@ -398,6 +414,8 @@ private:
     static int waitObjectId(const EeWaitState &wait);
     void writeGuestU32(uint32_t address, uint32_t value);
     void waitForEvent();
+    void runPacer();
+    void stopPacer();
     void scheduleEvent(uint64_t deadlineCycle, std::chrono::steady_clock::time_point hostDeadline, EeEvent event);
     void updateNextDeadline();
     [[nodiscard]] bool hasReadyAtOrAbovePriority(int priority) const;
@@ -467,6 +485,18 @@ private:
     uint32_t m_gsVSyncCallbackSp = 0;
     std::unordered_map<uint64_t, uint32_t> m_invocationStackTops;
     std::atomic<uint64_t> m_nextDeadlineCycle{0};
+
+    bool m_vblankCatchUp = false;
+    // Wakes the EE at a VBlank's host time while guest code runs, since
+    // checkpoints otherwise look at EE cycles only.
+    std::thread m_pacer;
+    std::condition_variable m_pacerCv;
+    bool m_pacerStop = false;
+    uint64_t m_deadlineGeneration = 0;
+    std::atomic<bool> m_hostDeadlineDue{false};
+    std::atomic<uint64_t> m_vblanksCaughtUp{0};
+    std::atomic<uint64_t> m_cyclesSkipped{0};
+    std::atomic<uint64_t> m_vblanksDropped{0};
 
     mutable std::mutex m_snapshotMutex;
     EeKernelSnapshot m_snapshot;
