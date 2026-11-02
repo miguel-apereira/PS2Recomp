@@ -581,13 +581,13 @@ const uint8_t *PS2Memory::mapVuMemory(uint32_t physAddr, uint32_t size, uint32_t
     }
     if (const uint8_t *ptr = mapRange(PS2_VU1_CODE_BASE, PS2_VU1_CODE_SIZE, m_vu1Code))
     {
-        syncGsAccess();
+        syncGsAccess(GsSyncReason::Vu1Memory);
         return ptr;
     }
     const uint8_t *ptr = mapRange(PS2_VU1_DATA_BASE, PS2_VU1_DATA_SIZE, m_vu1Data);
     if (ptr)
     {
-        syncGsAccess();
+        syncGsAccess(GsSyncReason::Vu1Memory);
     }
     return ptr;
 }
@@ -771,7 +771,7 @@ uint32_t PS2Memory::read32(uint32_t address)
 
     if (isGsPrivReg(address))
     {
-        syncGsAccess();
+        syncGsAccess(GsSyncReason::GsPrivRead);
         uint32_t off = address & 7;
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
@@ -820,7 +820,7 @@ uint64_t PS2Memory::read64(uint32_t address)
 
     if (isGsPrivReg(address))
     {
-        syncGsAccess();
+        syncGsAccess(GsSyncReason::GsPrivRead);
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
         {
@@ -988,7 +988,7 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
 
     if (isGsPrivReg(address))
     {
-        syncGsAccess();
+        syncGsAccess(GsSyncReason::GsPrivWrite);
         uint32_t off = address & 7;
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
@@ -1049,7 +1049,7 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
 
     if (isGsPrivReg(address))
     {
-        syncGsAccess();
+        syncGsAccess(GsSyncReason::GsPrivWrite);
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
         if (regOff == kGsCsrRegOffset)
         {
@@ -1178,7 +1178,7 @@ void PS2Memory::write128(uint32_t address, __m128i value)
 bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 {
     if (address >= 0x10003000u && address < 0x10003100u) // GIF registers
-        syncGsAccess();
+        syncGsAccess(GsSyncReason::GifRegister);
     if (address == 0x10003020u) // GIF_STAT: the FIFO count it may hold drains as time passes
         m_gifFifoCountSet = true;
     if (m_ipu)
@@ -1242,7 +1242,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
     if (isGsPrivReg(address))
     {
-        syncGsAccess();
+        syncGsAccess(GsSyncReason::GsPrivWrite);
         // NB: unreachable from write8/16/32/64 today since those all funnel IO
         // register writes through addresses in PS2_IO_BASE's range, which is
         // disjoint from PS2_GS_PRIV_REG_BASE; kept correct for direct callers.
@@ -2119,7 +2119,7 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t 
 
     if (pathId == GifPathId::Path3)
     {
-        syncGsAccess();
+        syncGsAccess(GsSyncReason::Path3);
         if (m_path3Masked)
         {
             m_path3MaskedFifo.emplace_back(data, data + sizeBytes);
@@ -2451,7 +2451,7 @@ int PS2Memory::pollDmaRegisters()
 uint32_t PS2Memory::readIORegister(uint32_t address)
 {
     if (address >= 0x10003000u && address < 0x10003100u) // GIF registers
-        syncGsAccess();
+        syncGsAccess(GsSyncReason::GifRegister);
     if (m_vif[0] && address >= 0x10003800u && address < 0x10003A00u)
     {
         return m_vif[0]->readRegister(address - 0x10003800u);
@@ -2502,7 +2502,7 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
 
     if (isGsPrivReg(address))
     {
-        syncGsAccess();
+        syncGsAccess(GsSyncReason::GsPrivRead);
         // NB: unreachable from read8/16/32/64 today, same reasoning as the write
         // path above; kept correct for direct callers.
         const uint32_t off = address & 7u;
@@ -2925,7 +2925,7 @@ void PS2Memory::serviceVif(int unit)
 
     if (unit == 1 && (chcrReg & 0x101u) == 0x100u)
     {
-        syncGsAccess(); // reads the GS
+        syncGsAccess(GsSyncReason::GsDownload); // reads the GS
 
         const uint32_t qwc = qwcReg & 0xFFFFu;
         std::vector<uint8_t> data(static_cast<size_t>(qwc) * 16u, 0u);

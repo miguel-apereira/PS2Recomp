@@ -191,12 +191,23 @@ public:
     // data memory, the GS privileged registers, the GIF registers, PATH3
     // and GS downloads. The hook must return at once when called on the
     // VU1 thread itself.
-    using GsSyncHook = std::function<void()>;
+    // The reason says which access asked for the sync (for stats).
+    enum class GsSyncReason : uint8_t
+    {
+        Vu1Memory,   // a guest pointer into VU1 code or data memory
+        GsPrivRead,  // a GS privileged register read
+        GsPrivWrite, // a GS privileged register write
+        GifRegister, // a GIF register read or write
+        Path3,       // a PATH3 packet to the GS
+        GsDownload,  // a GS-to-memory transfer (VIF1 DMA from the GS)
+        Count
+    };
+    using GsSyncHook = std::function<void(GsSyncReason)>;
     void setGsSyncHook(GsSyncHook hook) { m_gsSyncHook = std::move(hook); }
-    void syncGsAccess() const
+    void syncGsAccess(GsSyncReason reason) const
     {
         if (m_gsSyncHook)
-            m_gsSyncHook();
+            m_gsSyncHook(reason);
     }
     uint32_t takePendingDmac() { return m_pendingDmac.exchange(0u, std::memory_order_acq_rel); }
 
