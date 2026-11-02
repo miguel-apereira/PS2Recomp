@@ -1598,9 +1598,13 @@ void GS::vertexKick(bool drawing)
 
     if (drawing && m_backend)
     {
-        GSPrimitiveBatch batch = buildDrawBatch(needed);
-        updatePreferredDisplaySourceForDraw(batch);
-        m_backend->Submit(batch);
+        // A backend that doesn't draw (another renderer does) needs no batch.
+        if (m_backend->Draws())
+        {
+            GSPrimitiveBatch batch = buildDrawBatch(needed);
+            updatePreferredDisplaySourceForDraw(batch);
+            m_backend->Submit(batch);
+        }
         recordDrawDebugEventUnlocked(needed);
     }
 

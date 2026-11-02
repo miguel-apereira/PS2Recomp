@@ -14,6 +14,9 @@ public:
     virtual void Reset() = 0;
 
     virtual void Submit(const GSPrimitiveBatch &batch) = 0;
+    // False for a backend that ignores Submit (another renderer draws): the
+    // frontend then doesn't build primitive batches for it.
+    virtual bool Draws() const { return true; }
     virtual void LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut) = 0;
 
     virtual void BeginTransfer(const GSTransferCommand &command) = 0;
