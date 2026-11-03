@@ -583,6 +583,64 @@ void register_ps2_runtime_io_tests()
                      "sceMcGetDir file entries should carry the closed-file attribute");
         });
 
+        tc.Run("sceMcGetDir continues a listing a few entries at a time", [](TestCase &t)
+        {
+            // Games read a directory in chunks: mode 0 starts the listing, a
+            // nonzero mode continues it. Restarting each time would hand back
+            // the same entries forever.
+            TestContext test;
+
+            std::filesystem::create_directories(test.paths.mcRoot / "SAVEDATA");
+            const char *names[] = {"a.sav", "b.sav", "c.sav", "d.sav", "e.sav"};
+            for (const char *name : names)
+            {
+                std::ofstream out(test.paths.mcRoot / "SAVEDATA" / name, std::ios::binary);
+                out << name;
+            }
+
+            const uint32_t patternAddr = GUEST_STRING_AREA_START + 0x700;
+            writeGuestString(test.rdram.data(), patternAddr, "/SAVEDATA/*");
+
+            std::vector<std::string> seen;
+            std::vector<int32_t> counts;
+            for (int call = 0; call < 4; ++call)
+            {
+                std::memset(test.rdram.data() + GUEST_MC_TABLE_ADDR, 0, 4u * sizeof(SceMcTblGetDir));
+                clearContext(test.ctx);
+                setRegU32(test.ctx, 4, 0u);
+                setRegU32(test.ctx, 5, 0u);
+                setRegU32(test.ctx, 6, patternAddr);
+                setRegU32(test.ctx, 7, call == 0 ? 0u : 1u);
+                setRegU32(test.ctx, 8, 4u);
+                setRegU32(test.ctx, 9, GUEST_MC_TABLE_ADDR);
+                ps2_stubs::sceMcGetDir(test.rdram.data(), &test.ctx, nullptr);
+                int32_t cmd = 0;
+                const int32_t count = syncMc(test.rdram, &cmd);
+                counts.push_back(count);
+                const auto *entries = reinterpret_cast<const SceMcTblGetDir *>(test.rdram.data() + GUEST_MC_TABLE_ADDR);
+                for (int32_t i = 0; i < count; ++i)
+                    seen.emplace_back(entries[i].entryName);
+            }
+
+            t.Equals(counts[0], 4, "the first call should fill the table");
+            t.Equals(counts[1], 3, "the second call should return the rest");
+            t.Equals(counts[2], 0, "a call past the end should return no entries");
+            t.Equals(counts[3], 0, "and so should the next one");
+            const std::vector<std::string> expected = {".", "..", "a.sav", "b.sav", "c.sav", "d.sav", "e.sav"};
+            t.IsTrue(seen == expected, "every entry should come back once, in order");
+
+            // A new listing (mode 0) starts from the beginning again.
+            clearContext(test.ctx);
+            setRegU32(test.ctx, 6, patternAddr);
+            setRegU32(test.ctx, 8, 4u);
+            setRegU32(test.ctx, 9, GUEST_MC_TABLE_ADDR);
+            ps2_stubs::sceMcGetDir(test.rdram.data(), &test.ctx, nullptr);
+            int32_t cmd = 0;
+            t.Equals(syncMc(test.rdram, &cmd), 4, "mode 0 should start a new listing");
+            const auto *entries = reinterpret_cast<const SceMcTblGetDir *>(test.rdram.data() + GUEST_MC_TABLE_ADDR);
+            t.Equals(std::string(entries[0].entryName), std::string("."), "a new listing starts with '.'");
+        });
+
         tc.Run("sceMcGetInfo reports formatted and unformatted states", [](TestCase &t)
         {
             TestContext test;

@@ -4,6 +4,9 @@
 #include "ps2_runtime_macros.h"
 
 #include <algorithm>
+#include <array>
+#include <iostream>
+#include <unordered_map>
 #include <cassert>
 #include <cstring>
 #include <limits>
@@ -12,6 +15,59 @@
 
 namespace
 {
+    // Diagnostics for a guest thread that ends unexpectedly (its PC reaches 0
+    // or code that was never compiled): the last times the scheduler ran it,
+    // with PC, SP and RA going in and coming out. A return address read from
+    // a wrong stack slot shows as SP drifting between consecutive runs.
+    struct ThreadRunRecord
+    {
+        uint32_t pcIn = 0, spIn = 0, raIn = 0;
+        uint32_t pcOut = 0, spOut = 0, raOut = 0;
+        uint32_t depth = 0;   // interrupt/callback invocations on the thread
+        bool transfer = false; // left by a dispatcher transfer (wait, switch)
+        bool returned = false;
+    };
+    struct ThreadRunHistory
+    {
+        static constexpr size_t kSize = 48;
+        std::array<ThreadRunRecord, kSize> records{};
+        size_t next = 0;
+        size_t count = 0;
+        ThreadRunRecord &begin()
+        {
+            ThreadRunRecord &record = records[next];
+            record = {};
+            next = (next + 1) % kSize;
+            count = std::min(count + 1, kSize);
+            return record;
+        }
+    };
+    std::unordered_map<int, ThreadRunHistory> g_threadRuns; // executor thread only
+
+    void logThreadRuns(int threadId, const char *why)
+    {
+        const auto found = g_threadRuns.find(threadId);
+        std::cerr << "[ee-thread] thread " << threadId << " " << why << "; its last runs (oldest first):" << std::endl;
+        if (found == g_threadRuns.end())
+        {
+            return;
+        }
+        const ThreadRunHistory &history = found->second;
+        for (size_t i = 0; i < history.count; ++i)
+        {
+            const ThreadRunRecord &r =
+                history.records[(history.next + ThreadRunHistory::kSize - history.count + i) % ThreadRunHistory::kSize];
+            std::cerr << std::hex << "[ee-thread]   in pc=0x" << r.pcIn << " sp=0x" << r.spIn << " ra=0x" << r.raIn
+                      << std::dec << " depth=" << r.depth;
+            if (r.returned)
+            {
+                std::cerr << std::hex << " -> out pc=0x" << r.pcOut << " sp=0x" << r.spOut << " ra=0x" << r.raOut
+                          << std::dec << (r.transfer ? " (transfer)" : "");
+            }
+            std::cerr << std::endl;
+        }
+    }
+
     constexpr int KE_OK = 0;
     constexpr int KE_ERROR = -1;
     constexpr int KE_ILLEGAL_PRIORITY = -403;
@@ -339,6 +395,15 @@ void EeScheduler::run()
                 }
                 continue;
             }
+            if (running->id > 0)
+            {
+                std::cerr << std::hex << "[ee-thread] thread " << std::dec << running->id << std::hex
+                          << " (entry 0x" << running->entry << ") reached PC 0: ra=0x" << getRegU32(&context, 31)
+                          << " sp=0x" << getRegU32(&context, 29) << " v0=0x" << getRegU32(&context, 2)
+                          << " v1=0x" << getRegU32(&context, 3)
+                          << std::dec << std::endl;
+                logThreadRuns(running->id, "ended");
+            }
             makeDormant(*running);
             m_currentThreadId = 0;
             copyMainContextToRuntime();
@@ -373,6 +438,7 @@ void EeScheduler::run()
                                                 context.pc,
                                                 PS2Runtime::GuestBranchKind::DirectJump,
                                                 "EE scheduler");
+                logThreadRuns(running->id, "resumed at code that was never compiled");
                 makeDormant(*running);
                 m_currentThreadId = 0;
             }
@@ -385,6 +451,17 @@ void EeScheduler::run()
             continue;
         }
 
+        const int runThreadId = running->id;
+        const size_t runDepth = running->invocations.size();
+        ThreadRunRecord *run = nullptr;
+        if (runThreadId > 0 && runDepth == 0u)
+        {
+            run = &g_threadRuns[runThreadId].begin();
+            run->pcIn = context.pc;
+            run->spIn = getRegU32(&context, 29);
+            run->raIn = getRegU32(&context, 31);
+            run->depth = static_cast<uint32_t>(runDepth);
+        }
         try
         {
             m_insideInterrupt = !running->invocations.empty() && running->invocations.back().kind == GuestInvocationKind::Interrupt;
@@ -394,9 +471,28 @@ void EeScheduler::run()
             m_guestExecuting.store(false, std::memory_order_release);
             saveVu0();
             m_insideInterrupt = false;
+            if (run)
+            {
+                run->returned = true;
+                run->pcOut = context.pc;
+                run->spOut = getRegU32(&context, 29);
+                run->raOut = getRegU32(&context, 31);
+            }
         }
         catch (const EeDispatcherTransfer &)
         {
+            if (run)
+            {
+                if (GuestThread *owner = thread(runThreadId); owner && owner->invocations.empty())
+                {
+                    const R5900Context &own = owner->activeContext();
+                    run->returned = true;
+                    run->transfer = true;
+                    run->pcOut = own.pc;
+                    run->spOut = getRegU32(&own, 29);
+                    run->raOut = getRegU32(&own, 31);
+                }
+            }
             // Whatever threw saved VU0 first (the context may be gone now).
             m_vu0Context = nullptr;
             m_guestExecuting.store(false, std::memory_order_release);
