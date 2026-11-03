@@ -57,6 +57,10 @@ namespace
     constexpr uint64_t kVBlankPeriodCycles = microsecondsToEeCycles(16667u);
     constexpr uint64_t kVBlankDurationCycles = microsecondsToEeCycles(500u);
     constexpr uint64_t kAlarmTickCycles = microsecondsToEeCycles(kAlarmTickMicroseconds);
+    // With VBlank catch-up, the EE runs at least this long between VBlanks
+    // (an eighth of a frame), so a backlog after a stall comes at most eight
+    // times as fast as normal and the guest keeps working between them.
+    constexpr uint64_t kMinVBlankCatchUpCycles = kVBlankPeriodCycles / 8u;
 
     template <typename Map>
     int allocatePositiveId(int &nextId, const Map &objects)
@@ -106,8 +110,7 @@ void EeScheduler::runPacer()
         const ScheduledEvent *next = nullptr;
         for (const ScheduledEvent &item : m_deadlines)
         {
-            if ((item.event.type == EeEventType::VBlankStart || item.event.type == EeEventType::VBlankEnd) &&
-                item.hostDeadline > flagged &&
+            if (item.event.type == EeEventType::VBlankStart && item.hostDeadline > flagged &&
                 (next == nullptr || item.hostDeadline < next->hostDeadline))
             {
                 next = &item;
@@ -125,7 +128,7 @@ void EeScheduler::runPacer()
         if (!m_pacerCv.wait_until(lock, deadline, changed))
         {
             // The VBlank's host time has come. If the EE has not reached its
-            // cycles yet, the next checkpoint catches up.
+            // cycles yet, the next checkpoint brings it forward.
             flagged = deadline;
             m_hostDeadlineDue.store(true, std::memory_order_release);
             m_checkpointPending.store(true, std::memory_order_release);
@@ -181,6 +184,7 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     m_stopRequested.store(false, std::memory_order_release);
     m_checkpointPending.store(false, std::memory_order_release);
     m_hostDeadlineDue.store(false, std::memory_order_release);
+    m_lastVBlankStartCycle = 0u;
     m_vblanksCaughtUp.store(0u, std::memory_order_relaxed);
     m_cyclesSkipped.store(0u, std::memory_order_relaxed);
     m_vblanksDropped.store(0u, std::memory_order_relaxed);
@@ -1953,9 +1957,6 @@ void EeScheduler::processPendingEvents()
 void EeScheduler::processDueDeadlines()
 {
     m_hostDeadlineDue.store(false, std::memory_order_release);
-    // At most one VBlank edge is caught up per call, so the guest (the
-    // VBlank handlers' threads) runs between caught-up edges.
-    bool mayCatchUp = m_vblankCatchUp;
     for (;;)
     {
         std::vector<ScheduledEvent> due;
@@ -1963,8 +1964,35 @@ void EeScheduler::processDueDeadlines()
         {
             std::unique_lock lock(m_eventMutex);
             const auto now = std::chrono::steady_clock::now();
-            uint64_t catchUpCycle = 0u;
-            bool catchUpStart = false;
+            if (m_vblankCatchUp)
+            {
+                // A VBlank whose host time has passed comes early instead of
+                // waiting for its EE cycles, once the EE has run a little
+                // since the last one. The EE clock itself never jumps, so
+                // guest code mid-work (timeouts, COP0 Count, the IOP) sees
+                // continuous time.
+                const uint64_t earliest = m_lastVBlankStartCycle + kMinVBlankCatchUpCycles;
+                bool lowered = false;
+                for (ScheduledEvent &item : m_deadlines)
+                {
+                    if (item.event.type != EeEventType::VBlankStart || item.hostDeadline > now)
+                    {
+                        continue;
+                    }
+                    const uint64_t cycle = std::max(earliest, m_eeCycle);
+                    if (cycle < item.deadlineCycle)
+                    {
+                        m_cyclesSkipped.fetch_add(item.deadlineCycle - cycle, std::memory_order_relaxed);
+                        item.deadlineCycle = cycle;
+                        item.early = true;
+                        lowered = true;
+                    }
+                }
+                if (lowered)
+                {
+                    updateNextDeadline();
+                }
+            }
             for (const ScheduledEvent &item : m_deadlines)
             {
                 if (item.deadlineCycle <= m_eeCycle &&
@@ -1973,46 +2001,12 @@ void EeScheduler::processDueDeadlines()
                 {
                     pacingDeadline = item.hostDeadline;
                 }
-                if (mayCatchUp && item.deadlineCycle > m_eeCycle && item.hostDeadline <= now &&
-                    (item.event.type == EeEventType::VBlankStart || item.event.type == EeEventType::VBlankEnd) &&
-                    (catchUpCycle == 0u || item.deadlineCycle < catchUpCycle))
-                {
-                    catchUpCycle = item.deadlineCycle;
-                    catchUpStart = item.event.type == EeEventType::VBlankStart;
-                }
             }
 
             if (pacingDeadline == std::chrono::steady_clock::time_point{})
             {
-                if (catchUpCycle == 0u)
-                {
-                    updateNextDeadline();
-                    return;
-                }
-                // The host is behind the PS2: skip the EE ahead to the VBlank
-                // instead of making it wait for the cycles (slow motion).
-                lock.unlock();
-                mayCatchUp = false;
-                // Still behind after this one: the next checkpoint looks again.
-                m_hostDeadlineDue.store(true, std::memory_order_release);
-                if (catchUpStart)
-                {
-                    m_vblanksCaughtUp.fetch_add(1u, std::memory_order_relaxed);
-                }
-                uint64_t remaining = catchUpCycle - m_eeCycle;
-                m_cyclesSkipped.fetch_add(remaining, std::memory_order_relaxed);
-                while (remaining > 0u)
-                {
-                    const uint32_t step = static_cast<uint32_t>(std::min<uint64_t>(remaining, std::numeric_limits<uint32_t>::max()));
-                    accountCycles(step);
-                    remaining -= step;
-                }
-                continue;
-            }
-            if (catchUpCycle != 0u)
-            {
-                // Due events go first; the VBlank is caught up after them.
-                m_hostDeadlineDue.store(true, std::memory_order_release);
+                updateNextDeadline();
+                return;
             }
 
             if (now < pacingDeadline)
@@ -2065,8 +2059,13 @@ void EeScheduler::processDueDeadlines()
             if (scheduled.event.type == EeEventType::VBlankStart)
             {
                 auto hostDeadline = scheduled.hostDeadline;
+                m_lastVBlankStartCycle = m_eeCycle;
                 if (m_vblankCatchUp)
                 {
+                    if (scheduled.early)
+                    {
+                        m_vblanksCaughtUp.fetch_add(1u, std::memory_order_relaxed);
+                    }
                     const auto now = std::chrono::steady_clock::now();
                     if (hostDeadline + kMaxVBlankBacklog < now)
                     {

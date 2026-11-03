@@ -155,19 +155,26 @@ namespace
         return pred();
     }
 
-    // A guest loop on a host far slower than the PS2: each pass costs a
-    // few EE cycles and 2 ms of host time.
+    // A guest loop on a host slower than the PS2: each pass runs 200,000
+    // EE cycles in 2 ms of host time (about a third of PS2 speed).
+    constexpr uint32_t kSlowHostPassCycles = 200000u;
+    constexpr auto kSlowHostRun = std::chrono::milliseconds(200);
     std::chrono::steady_clock::time_point g_slowHostStart{};
     uint64_t g_slowHostTicks = 0u;
-    std::chrono::milliseconds g_slowHostElapsed{};
+    uint64_t g_slowHostPasses = 0u;
+    uint64_t g_slowHostLargestStep = 0u;
+    uint64_t g_slowHostLastCycle = 0u;
 
     void slowHostLoop(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
     {
+        EeScheduler &scheduler = runtime->eeScheduler();
+        g_slowHostLargestStep = std::max(g_slowHostLargestStep, scheduler.eeCycle() - g_slowHostLastCycle);
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
-        g_slowHostTicks = runtime->eeScheduler().currentVSyncTick();
-        g_slowHostElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - g_slowHostStart);
-        if (g_slowHostTicks >= 6u || g_slowHostElapsed >= std::chrono::milliseconds(250))
+        scheduler.accountCycles(kSlowHostPassCycles);
+        ++g_slowHostPasses;
+        g_slowHostLastCycle = scheduler.eeCycle();
+        g_slowHostTicks = scheduler.currentVSyncTick();
+        if (std::chrono::steady_clock::now() - g_slowHostStart >= kSlowHostRun)
         {
             ctx->pc = 0u;
             runtime->requestStop();
@@ -180,6 +187,9 @@ namespace
     {
         env.runtime.registerFunction(kSlowHostPc, slowHostLoop);
         g_slowHostTicks = 0u;
+        g_slowHostPasses = 0u;
+        g_slowHostLargestStep = 0u;
+        g_slowHostLastCycle = 0u;
         R5900Context mainContext{};
         mainContext.pc = kSlowHostPc;
         EeScheduler &scheduler = env.runtime.eeScheduler();
@@ -599,22 +609,22 @@ void register_ps2_runtime_interrupt_tests()
         {
             TestEnv env;
             runSlowHost(env, false);
-            t.Equals(g_slowHostTicks, 0ull, "no VBlank should fire before the EE runs its cycles");
+            // 200 ms of host time is 12 VBlanks; the EE ran at most a third of that.
+            t.IsTrue(g_slowHostTicks <= 5u, "VBlanks should follow the EE's cycles");
         });
 
-        tc.Run("VBlank catch-up keeps host time when the EE falls behind", [](TestCase &t)
+        tc.Run("VBlank catch-up keeps host time when the EE falls behind, without jumping the EE clock", [](TestCase &t)
         {
             TestEnv env;
             runSlowHost(env, true);
             const EeScheduler::VBlankCatchUpStats stats = env.runtime.eeScheduler().takeVBlankCatchUpStats();
-            t.Equals(g_slowHostTicks, 6ull, "VBlanks should follow host time");
-            // 6 VBlanks take 100 ms of host time; allow for a slow test machine.
-            t.IsTrue(g_slowHostElapsed >= std::chrono::milliseconds(90) &&
-                         g_slowHostElapsed < std::chrono::milliseconds(250),
-                     "VBlanks should not run ahead of host time");
-            t.IsTrue(stats.caughtUp >= 5u, "the VBlanks should be counted as caught up");
-            t.IsTrue(stats.skippedCycles > 5u * 4000000u, "the EE should skip ahead about a VBlank of cycles each time");
+            t.IsTrue(g_slowHostTicks >= 9u && g_slowHostTicks <= 12u, "VBlanks should follow host time (12 in 200 ms)");
+            t.IsTrue(stats.caughtUp >= 6u, "most VBlanks should come early");
+            t.IsTrue(stats.skippedCycles > 0u, "the early VBlanks should count the cycles they came early by");
             t.Equals(stats.dropped, 0ull, "nothing should be dropped this close to host time");
+            t.IsTrue(g_slowHostLargestStep < 10000u, "the EE clock should never jump between guest passes");
+            t.IsTrue(env.runtime.eeScheduler().eeCycle() <= g_slowHostPasses * (kSlowHostPassCycles + 10000u),
+                     "the EE clock should only count the cycles the guest ran");
         });
 
         tc.Run("VBlank IRQ invocation completes before the resumed base context", [](TestCase &t)
