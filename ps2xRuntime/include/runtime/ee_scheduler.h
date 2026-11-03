@@ -286,15 +286,17 @@ public:
 
     // VBlank catch-up. Off: a VBlank waits for both its host time and its
     // EE cycles, so an EE that runs slower than the PS2 runs the game in
-    // slow motion. On: once a VBlank's host time has passed, the EE cycle
-    // count jumps to it and it fires, so a slow host drops frames instead
-    // and the game keeps real time. Set before run().
+    // slow motion. On: once a VBlank's host time has passed it fires without
+    // waiting for the rest of its EE cycles (after at least an eighth of a
+    // frame of EE time since the last one), so a slow host drops frames
+    // instead and the game keeps real time. The EE clock does not jump.
+    // Set before run().
     void setVBlankCatchUp(bool enabled) noexcept { m_vblankCatchUp = enabled; }
     [[nodiscard]] bool vblankCatchUp() const noexcept { return m_vblankCatchUp; }
     struct VBlankCatchUpStats
     {
         uint64_t caughtUp = 0;  // VBlanks fired before the EE reached their cycles
-        uint64_t skippedCycles = 0; // EE cycles skipped to reach them
+        uint64_t skippedCycles = 0; // EE cycles they came early by
         uint64_t dropped = 0;   // VBlanks dropped because the host fell too far behind
     };
     // Counts since the last call.
@@ -391,6 +393,7 @@ private:
         std::chrono::steady_clock::time_point hostDeadline{};
         EeEvent event{};
         uint64_t sequence = 0;
+        bool early = false; // brought forward by VBlank catch-up
     };
 
     void assertExecutor() const;
@@ -487,6 +490,7 @@ private:
     std::atomic<uint64_t> m_nextDeadlineCycle{0};
 
     bool m_vblankCatchUp = false;
+    uint64_t m_lastVBlankStartCycle = 0;
     // Wakes the EE at a VBlank's host time while guest code runs, since
     // checkpoints otherwise look at EE cycles only.
     std::thread m_pacer;
