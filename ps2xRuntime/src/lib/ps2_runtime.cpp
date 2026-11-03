@@ -110,6 +110,13 @@ namespace
 
     thread_local DispatchHistory g_dispatchHistory;
 
+    // Counts the times generated code started to unwind to the scheduler: a
+    // dispatch that did not run its target (checkpoint, jump, missing
+    // function) or a checkpoint at a loop edge. A call whose callee comes back
+    // with the PC still at the callee's entry finished only if this did not
+    // change meanwhile (see dispatchGuestBranch).
+    thread_local uint64_t g_guestUnwinds = 0u;
+
     bool computeFileCrc32(const std::string &path, uint32_t &crcOut)
     {
         std::ifstream file(path, std::ios::binary);
@@ -1505,6 +1512,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     // this charge bounds straight-line call chains that have no local loop.
     if (m_eeScheduler && m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles))
     {
+        ++g_guestUnwinds;
         return false;
     }
 
@@ -1516,6 +1524,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         }
 
         ctx->pc = targetPc;
+        ++g_guestUnwinds;
         return false;
     }
 
@@ -1535,14 +1544,17 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         {
             ctx->pc = targetPc;
             // if you need the app to keep open to open debug pannel change this to false
+            ++g_guestUnwinds;
             return false;
         }
 
+        ++g_guestUnwinds;
         return false;
     }
 
     RecompiledFunction targetFn = lookupFunction(targetPc);
     const uint32_t entryPc = ctx->pc;
+    const uint64_t unwindsBefore = g_guestUnwinds;
     targetFn(rdram, ctx, this);
 
     if (isStopRequested() || ctx->pc == 0u)
@@ -1552,6 +1564,16 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
 
     if (ctx->pc == entryPc)
     {
+        // A host function that leaves the PC alone has finished. Generated
+        // code that comes back with the PC at its own entry is unwinding
+        // instead: it was about to call (or jump to) this same address again,
+        // and a checkpoint stopped it there, as in a recursive call. Treating
+        // that as a return would carry on in this function with the callee's
+        // stack frame and registers.
+        if (g_guestUnwinds != unwindsBefore)
+        {
+            return false;
+        }
         ctx->pc = fallthroughPc;
     }
 
@@ -2393,7 +2415,12 @@ void PS2Runtime::postEeEvent(EeEvent event)
 
 bool PS2Runtime::eeCheckpointDue(uint32_t cycles) noexcept
 {
-    return m_eeScheduler->checkpointDue(cycles);
+    if (!m_eeScheduler->checkpointDue(cycles))
+    {
+        return false;
+    }
+    ++g_guestUnwinds; // the caller returns to the scheduler now
+    return true;
 }
 
 [[noreturn]] void PS2Runtime::eeWaitVSyncTicks(uint32_t ticks, uint32_t resumePc)
