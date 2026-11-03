@@ -290,9 +290,25 @@ public:
     // waiting for the rest of its EE cycles (after at least an eighth of a
     // frame of EE time since the last one), so a slow host drops frames
     // instead and the game keeps real time. The EE clock does not jump.
-    // Set before run().
-    void setVBlankCatchUp(bool enabled) noexcept { m_vblankCatchUp = enabled; }
-    [[nodiscard]] bool vblankCatchUp() const noexcept { return m_vblankCatchUp; }
+    // May change while the guest runs.
+    void setVBlankCatchUp(bool enabled) noexcept { m_vblankCatchUp.store(enabled, std::memory_order_relaxed); }
+    [[nodiscard]] bool vblankCatchUp() const noexcept { return m_vblankCatchUp.load(std::memory_order_relaxed); }
+
+    // Live controls for a host's developer tools, safe from any thread.
+    // Pause: the EE stops at its next checkpoint, so the guest's threads,
+    // VBlanks and timers all wait. On resume, host deadlines move on by the
+    // time spent paused, so the game carries on where it stopped instead of
+    // catching up.
+    void setPaused(bool paused);
+    // True while the EE is held by setPaused (not just asked to stop).
+    [[nodiscard]] bool paused() const noexcept { return m_pausedNow.load(std::memory_order_acquire); }
+    // Resumes until the next VBlank starts, then pauses again.
+    void stepVBlank();
+    // Game speed: VBlank host time runs at this multiple of real time (0.5 is
+    // half speed, 2 is double when the host keeps up). 0: unlimited, VBlanks
+    // follow EE cycles only (catch-up does not apply).
+    void setSpeed(float speed) noexcept { m_speed.store(speed < 0.0f ? 0.0f : speed, std::memory_order_relaxed); }
+    [[nodiscard]] float speed() const noexcept { return m_speed.load(std::memory_order_relaxed); }
     struct VBlankCatchUpStats
     {
         uint64_t caughtUp = 0;  // VBlanks fired before the EE reached their cycles
@@ -417,6 +433,7 @@ private:
     static int waitObjectId(const EeWaitState &wait);
     void writeGuestU32(uint32_t address, uint32_t value);
     void waitForEvent();
+    void waitWhilePaused();
     void runPacer();
     void stopPacer();
     void scheduleEvent(uint64_t deadlineCycle, std::chrono::steady_clock::time_point hostDeadline, EeEvent event);
@@ -489,7 +506,11 @@ private:
     std::unordered_map<uint64_t, uint32_t> m_invocationStackTops;
     std::atomic<uint64_t> m_nextDeadlineCycle{0};
 
-    bool m_vblankCatchUp = false;
+    std::atomic<bool> m_vblankCatchUp{false};
+    std::atomic<float> m_speed{1.0f};
+    std::atomic<bool> m_pauseRequested{false};
+    std::atomic<bool> m_pausedNow{false};
+    std::atomic<uint64_t> m_pauseAtTick{0}; // stepVBlank: pause once this VBlank starts
     uint64_t m_lastVBlankStartCycle = 0;
     // Wakes the EE at a VBlank's host time while guest code runs, since
     // checkpoints otherwise look at EE cycles only.
