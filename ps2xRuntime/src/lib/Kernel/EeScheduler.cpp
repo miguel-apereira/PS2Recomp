@@ -239,7 +239,8 @@ void EeScheduler::run()
         EeScheduler &scheduler;
         ~PacerGuard() { scheduler.stopPacer(); }
     } pacerGuard{*this};
-    if (m_vblankCatchUp && !m_pacer.joinable())
+    // The pacer runs even without catch-up, which may be turned on later.
+    if (!m_pacer.joinable())
     {
         {
             std::lock_guard lock(m_eventMutex);
@@ -433,6 +434,57 @@ void EeScheduler::requestStop()
     m_stopRequested.store(true, std::memory_order_release);
     m_checkpointPending.store(true, std::memory_order_release);
     m_eventCv.notify_all();
+}
+
+void EeScheduler::setPaused(bool paused)
+{
+    {
+        std::lock_guard lock(m_eventMutex);
+        m_pauseRequested.store(paused, std::memory_order_release);
+        if (paused)
+        {
+            m_checkpointPending.store(true, std::memory_order_release);
+        }
+        else
+        {
+            m_pauseAtTick.store(0u, std::memory_order_relaxed);
+        }
+    }
+    m_eventCv.notify_all();
+}
+
+void EeScheduler::stepVBlank()
+{
+    m_pauseAtTick.store(m_runtime.memory().gs().vsyncTick.load(std::memory_order_acquire) + 1u,
+                        std::memory_order_relaxed);
+    {
+        std::lock_guard lock(m_eventMutex);
+        m_pauseRequested.store(false, std::memory_order_release);
+    }
+    m_eventCv.notify_all();
+}
+
+void EeScheduler::waitWhilePaused()
+{
+    std::unique_lock lock(m_eventMutex);
+    if (!m_pauseRequested.load(std::memory_order_acquire))
+    {
+        return;
+    }
+    m_pausedNow.store(true, std::memory_order_release);
+    const auto since = std::chrono::steady_clock::now();
+    m_eventCv.wait(lock, [this]()
+                   { return !m_pauseRequested.load(std::memory_order_acquire) ||
+                            m_stopRequested.load(std::memory_order_acquire); });
+    const auto pausedFor = std::chrono::steady_clock::now() - since;
+    for (ScheduledEvent &item : m_deadlines)
+    {
+        item.hostDeadline += pausedFor;
+    }
+    updateNextDeadline();
+    m_pausedNow.store(false, std::memory_order_release);
+    lock.unlock();
+    m_pacerCv.notify_one();
 }
 
 void EeScheduler::postEvent(EeEvent event)
@@ -1948,7 +2000,8 @@ void EeScheduler::processPendingEvents()
         const bool cycleEventDue = nextEventCycle != 0u && m_eeCycle >= nextEventCycle;
         const bool pendingWork = !m_events.empty() || cycleEventDue ||
                                  m_hostDeadlineDue.load(std::memory_order_acquire) ||
-                                 m_stopRequested.load(std::memory_order_acquire);
+                                 m_stopRequested.load(std::memory_order_acquire) ||
+                                 m_pauseRequested.load(std::memory_order_acquire);
         m_checkpointPending.store(pendingWork, std::memory_order_release);
     }
     applyPendingPreemption();
@@ -1956,7 +2009,11 @@ void EeScheduler::processPendingEvents()
 
 void EeScheduler::processDueDeadlines()
 {
+    waitWhilePaused();
     m_hostDeadlineDue.store(false, std::memory_order_release);
+    // Unlimited speed has no host time to catch up to.
+    const float speed = m_speed.load(std::memory_order_relaxed);
+    const bool catchUp = m_vblankCatchUp.load(std::memory_order_relaxed) && speed > 0.0f;
     for (;;)
     {
         std::vector<ScheduledEvent> due;
@@ -1964,7 +2021,7 @@ void EeScheduler::processDueDeadlines()
         {
             std::unique_lock lock(m_eventMutex);
             const auto now = std::chrono::steady_clock::now();
-            if (m_vblankCatchUp)
+            if (catchUp)
             {
                 // A VBlank whose host time has passed comes early instead of
                 // waiting for its EE cycles, once the EE has run a little
@@ -2013,8 +2070,10 @@ void EeScheduler::processDueDeadlines()
             {
                 m_eventCv.wait_until(lock, pacingDeadline, [this]()
                                      { return !m_events.empty() ||
-                                              m_stopRequested.load(std::memory_order_acquire); });
-                if (!m_events.empty() || m_stopRequested.load(std::memory_order_acquire))
+                                              m_stopRequested.load(std::memory_order_acquire) ||
+                                              m_pauseRequested.load(std::memory_order_acquire); });
+                if (!m_events.empty() || m_stopRequested.load(std::memory_order_acquire) ||
+                    m_pauseRequested.load(std::memory_order_acquire))
                 {
                     updateNextDeadline();
                     return;
@@ -2060,25 +2119,44 @@ void EeScheduler::processDueDeadlines()
             {
                 auto hostDeadline = scheduled.hostDeadline;
                 m_lastVBlankStartCycle = m_eeCycle;
-                if (m_vblankCatchUp)
+                // The game speed scales the VBlank's host time (setSpeed).
+                std::chrono::nanoseconds period = kVBlankPeriod;
+                std::chrono::nanoseconds duration = kVBlankDuration;
+                if (speed <= 0.0f)
                 {
-                    if (scheduled.early)
+                    // Unlimited: no host time to wait for.
+                    hostDeadline = std::chrono::steady_clock::now();
+                    period = duration = std::chrono::nanoseconds(0);
+                }
+                else
+                {
+                    if (speed != 1.0f)
+                    {
+                        period = std::chrono::nanoseconds(static_cast<int64_t>(static_cast<double>(period.count()) / speed));
+                        duration = std::chrono::nanoseconds(static_cast<int64_t>(static_cast<double>(duration.count()) / speed));
+                    }
+                    if (catchUp && scheduled.early)
                     {
                         m_vblanksCaughtUp.fetch_add(1u, std::memory_order_relaxed);
                     }
                     const auto now = std::chrono::steady_clock::now();
+                    // Catch-up drops a long backlog. Without it, a deadline
+                    // left in the past (after unlimited speed) restarts now.
                     if (hostDeadline + kMaxVBlankBacklog < now)
                     {
-                        const auto behind = now - hostDeadline;
-                        m_vblanksDropped.fetch_add(static_cast<uint64_t>(behind / kVBlankPeriod), std::memory_order_relaxed);
+                        if (catchUp)
+                        {
+                            const auto behind = now - hostDeadline;
+                            m_vblanksDropped.fetch_add(static_cast<uint64_t>(behind / period), std::memory_order_relaxed);
+                        }
                         hostDeadline = now;
                     }
                 }
                 scheduleEvent(scheduled.deadlineCycle + kVBlankDurationCycles,
-                              hostDeadline + kVBlankDuration,
+                              hostDeadline + duration,
                               EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
                 scheduleEvent(scheduled.deadlineCycle + kVBlankPeriodCycles,
-                              hostDeadline + kVBlankPeriod,
+                              hostDeadline + period,
                               EeEvent{EeEventType::VBlankStart, 0, 0});
             }
             processEvent(scheduled.event);
@@ -2096,6 +2174,14 @@ void EeScheduler::processEvent(const EeEvent &event)
     case EeEventType::VBlankStart:
         ++m_vsyncTick;
         m_runtime.memory().gs().vsyncTick.store(m_vsyncTick, std::memory_order_release);
+        if (const uint64_t pauseAt = m_pauseAtTick.load(std::memory_order_relaxed);
+            pauseAt != 0u && m_vsyncTick >= pauseAt)
+        {
+            // stepVBlank: the VBlank's handlers run, then the next checkpoint pauses.
+            m_pauseAtTick.store(0u, std::memory_order_relaxed);
+            m_pauseRequested.store(true, std::memory_order_release);
+            m_checkpointPending.store(true, std::memory_order_release);
+        }
         m_runtime.gs().vsync(m_vsyncTick);
         if ((m_vsyncTick & 1u) != 0u)
         {
@@ -2226,7 +2312,8 @@ void EeScheduler::writeGuestU32(uint32_t address, uint32_t value)
 void EeScheduler::waitForEvent()
 {
     std::unique_lock lock(m_eventMutex);
-    if (!m_events.empty() || m_stopRequested.load(std::memory_order_acquire))
+    if (!m_events.empty() || m_stopRequested.load(std::memory_order_acquire) ||
+        m_pauseRequested.load(std::memory_order_acquire))
     {
         return;
     }
@@ -2235,7 +2322,8 @@ void EeScheduler::waitForEvent()
     if (m_deadlines.empty() && !hasTimerDeadline)
     {
         m_eventCv.wait(lock, [this]()
-                       { return !m_events.empty() || m_stopRequested.load(std::memory_order_acquire); });
+                       { return !m_events.empty() || m_stopRequested.load(std::memory_order_acquire) ||
+                                m_pauseRequested.load(std::memory_order_acquire); });
         return;
     }
 
@@ -2267,7 +2355,8 @@ void EeScheduler::waitForEvent()
 
     const bool signaled = m_eventCv.wait_until(lock, hostDeadline, [this]()
                                                { return !m_events.empty() ||
-                                                        m_stopRequested.load(std::memory_order_acquire); });
+                                                        m_stopRequested.load(std::memory_order_acquire) ||
+                                                        m_pauseRequested.load(std::memory_order_acquire); });
     if (!signaled)
     {
         const uint64_t elapsed = deadlineCycle > m_eeCycle ? deadlineCycle - m_eeCycle : 0u;
