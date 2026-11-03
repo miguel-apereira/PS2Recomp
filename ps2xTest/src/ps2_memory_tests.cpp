@@ -9,6 +9,8 @@
 #include "Stubs/GS.h"
 
 #include <algorithm>
+#include <thread>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <random>
@@ -1153,6 +1155,49 @@ void register_ps2_memory_tests()
             t.Equals(order[0], static_cast<uint8_t>(0x11u), "PATH1 should be drained first");
             t.Equals(order[1], static_cast<uint8_t>(0x22u), "PATH2 should be drained second");
             t.Equals(order[2], static_cast<uint8_t>(0x33u), "PATH3 should be drained third");
+        });
+
+        tc.Run("GIF arbiter takes packets from two threads at once", [](TestCase &t)
+        {
+            // VIF1 on its own thread submits and drains PATH1 while the EE
+            // drains after its DMA transfers.
+            constexpr int kPackets = 20000;
+            std::vector<uint8_t> seen;
+            int outOfOrder = 0;
+            GifArbiter arbiter([&](const uint8_t *data, uint32_t sizeBytes)
+            {
+                if (!data || sizeBytes < 16u)
+                    return;
+                uint32_t index = 0;
+                std::memcpy(&index, data + 8, sizeof(index));
+                if (data[0] == 0x11u)
+                {
+                    if (!seen.empty() && index != 0u && seen.back() != static_cast<uint8_t>(index - 1u))
+                        ++outOfOrder;
+                    seen.push_back(static_cast<uint8_t>(index));
+                }
+            });
+            std::atomic<bool> done{false};
+            std::thread ee([&]()
+            {
+                while (!done.load(std::memory_order_acquire))
+                    arbiter.drain();
+            });
+            for (int n = 0; n < kPackets; ++n)
+            {
+                uint8_t packet[16] = {0x11u};
+                const uint32_t index = static_cast<uint32_t>(n);
+                std::memcpy(packet + 8, &index, sizeof(index));
+                arbiter.submit(GifPathId::Path1, packet, sizeof(packet));
+                arbiter.drain();
+            }
+            done.store(true, std::memory_order_release);
+            ee.join();
+            arbiter.drain();
+
+            t.Equals(seen.size(), static_cast<size_t>(kPackets), "every packet should reach the GS once");
+            t.Equals(outOfOrder, 0, "packets from one path should stay in order");
+            t.IsTrue(arbiter.empty(), "nothing should be left queued");
         });
 
         tc.Run("VIF DIRECTHL stalls behind queued PATH3 IMAGE packets", [](TestCase &t)
