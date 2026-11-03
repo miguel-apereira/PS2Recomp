@@ -147,6 +147,20 @@ namespace
         }
     }
 
+    // Generated code that leaves for the scheduler on its way to its own
+    // entry again (here a jump; a recursive call stopped by a checkpoint does
+    // the same): the PC comes back at the entry, but the function is not done.
+    void testGuestBranchReentryHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        ctx->pc = 0x3000u;
+        setRegU32(*ctx, 29, ::getRegU32(ctx, 29) - 0x80u); // its stack frame
+        if (!runtime->dispatchGuestBranch(rdram, ctx, 0x3000u, 0x3010u, 0u,
+                                          PS2Runtime::GuestBranchKind::DirectJump, "test-j"))
+        {
+            return;
+        }
+    }
+
     void testGuestBranchImplicitReturnHandler(uint8_t *, R5900Context *ctx, PS2Runtime *)
     {
         if (ctx)
@@ -404,6 +418,38 @@ void register_ps2_runtime_expansion_tests()
                      "unchanged callee PC should be converted to call fallthrough");
             t.Equals(::getRegU32(&ctx, 2), 0x00FACE42u,
                      "callee should still execute normally");
+        });
+
+        tc.Run("dispatchGuestBranch call does not finish a callee that unwinds to its own entry", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            runtime.registerFunction(0x3000u, &testGuestBranchReentryHandler);
+
+            R5900Context ctx{};
+            ctx.pc = 0x2000u;
+            setRegU32(ctx, 29, 0x1000u);
+
+            const bool returnedToFallthrough = runtime.dispatchGuestBranch(
+                nullptr,
+                &ctx,
+                0x3000u,
+                0x2000u,
+                0x2008u,
+                PS2Runtime::GuestBranchKind::IndirectCall,
+                "test-jalr");
+
+            t.IsFalse(returnedToFallthrough,
+                      "a callee on its way back to its own entry has not returned");
+            t.Equals(ctx.pc, 0x3000u, "the scheduler should resume at the callee's entry");
+            t.Equals(::getRegU32(&ctx, 29), 0xF80u, "the callee's stack frame stays in place");
+
+            // A host function that leaves the PC alone afterwards still counts as finished.
+            runtime.registerFunction(0x4000u, &testGuestBranchImplicitReturnHandler);
+            ctx.pc = 0x2000u;
+            t.IsTrue(runtime.dispatchGuestBranch(nullptr, &ctx, 0x4000u, 0x2000u, 0x2008u,
+                                                 PS2Runtime::GuestBranchKind::IndirectCall, "test-jalr"),
+                     "a host function that leaves the PC at its entry has finished");
+            t.Equals(ctx.pc, 0x2008u, "it returns to the call's fallthrough");
         });
 
         tc.Run("dispatchGuestBranch jump returns to central dispatcher without nesting", [](TestCase &t)
