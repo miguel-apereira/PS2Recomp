@@ -6,6 +6,34 @@
 #include <sstream>
 #include <cmath>
 
+namespace
+{
+    // VU0's macro-mode memory instructions address VU0 data memory
+    // (0x11004000, 4 KB) in quadwords; addresses wrap at its end.
+    std::string vu0QuadwordAddress(uint8_t vi)
+    {
+        return fmt::format("(0x11004000u + ((static_cast<uint32_t>(ctx->vi[{}]) & 0xFFu) << 4))", vi);
+    }
+
+    // The byte offset of the one field VILWR and VISWR name (x, y, z or w).
+    uint32_t vu0FieldOffset(uint8_t destMask)
+    {
+        if (destMask & 0x8)
+            return 0u;
+        if (destMask & 0x4)
+            return 4u;
+        if (destMask & 0x2)
+            return 8u;
+        return 12u;
+    }
+
+    std::string laneMask(uint8_t destMask)
+    {
+        return fmt::format("_mm_set_epi32({}, {}, {}, {})", (destMask & 0x1) ? -1 : 0, (destMask & 0x2) ? -1 : 0,
+                           (destMask & 0x4) ? -1 : 0, (destMask & 0x8) ? -1 : 0);
+    }
+}
+
 namespace ps2recomp
 {
     std::string CodeGenerator::translateVU_VADD_Field(const Instruction &inst)
@@ -118,12 +146,16 @@ namespace ps2recomp
 
     std::string CodeGenerator::translateVU_VILWR(const Instruction &inst)
     {
-        return fmt::format("{{ uint32_t addr = (uint32_t)(ctx->vi[{}] << 2) & 0x3FFC; ctx->vi[{}] = static_cast<uint16_t>(READ32(addr)); }}", inst.rd, inst.rt); // VILWR.<f> vit, (vis)
+        // VILWR.<f> it, (is): it is rt, is is rd.
+        return fmt::format("{{ ctx->vi[{}] = static_cast<uint16_t>(READ32({} + {}u)); }}", inst.rt,
+                           vu0QuadwordAddress(inst.rd), vu0FieldOffset(inst.vectorInfo.vectorField));
     }
 
     std::string CodeGenerator::translateVU_VISWR(const Instruction &inst)
     {
-        return fmt::format("{{ uint32_t addr = (uint32_t)(ctx->vi[{}] << 2) & 0x3FFC; WRITE32(addr, (uint32_t)ctx->vi[{}]); }}", inst.rd, inst.rt); // VISWR.<f> vit, (vis)
+        // VISWR.<f> it, (is): it is rt, is is rd.
+        return fmt::format("{{ WRITE32({} + {}u, static_cast<uint32_t>(ctx->vi[{}])); }}",
+                           vu0QuadwordAddress(inst.rd), vu0FieldOffset(inst.vectorInfo.vectorField), inst.rt);
     }
 
     std::string CodeGenerator::translateVU_VIADD(const Instruction &inst)
@@ -759,66 +791,44 @@ namespace ps2recomp
 
     std::string CodeGenerator::translateVU_VLQI(const Instruction &inst)
     {
-        uint8_t vis = inst.rd;
-        uint8_t dest_mask = inst.vectorInfo.vectorField;
-        return fmt::format("{{ uint32_t addr = ((uint32_t)(ctx->vi[{}] & 0x3FF)) << 4; "
-                           "__m128 res = _mm_castsi128_ps(READ128(addr)); "
-                           "__m128i mask = _mm_set_epi32({}, {}, {}, {}); "
-                           "ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], res, _mm_castsi128_ps(mask)); "
-                           "ctx->vi[{}] = (ctx->vi[{}] + 1) & 0x3FF; }}",
-                           vis,
-                           (dest_mask & 0x1) ? -1 : 0, (dest_mask & 0x2) ? -1 : 0,
-                           (dest_mask & 0x4) ? -1 : 0, (dest_mask & 0x8) ? -1 : 0,
-                           inst.rt, inst.rt,
-                           vis, vis);
+        // VLQI.dest ft, (is++): ft is rt, is is rd.
+        return fmt::format("{{ __m128 res = _mm_castsi128_ps(READ128({})); "
+                           "ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], res, _mm_castsi128_ps({})); "
+                           "ctx->vi[{}] = static_cast<uint16_t>(ctx->vi[{}] + 1); }}",
+                           vu0QuadwordAddress(inst.rd), inst.rt, inst.rt, laneMask(inst.vectorInfo.vectorField),
+                           inst.rd, inst.rd);
     }
 
     std::string CodeGenerator::translateVU_VSQI(const Instruction &inst)
     {
-        uint8_t vis = inst.rd;
-        uint8_t dest_mask = inst.vectorInfo.vectorField;
-        return fmt::format("{{ uint32_t addr = ((uint32_t)(ctx->vi[{}] & 0x3FF)) << 4; "
-                           "__m128i old_val = READ128(addr); "
-                           "__m128 res = _mm_blendv_ps(_mm_castsi128_ps(old_val), ctx->vu0_vf[{}], _mm_castsi128_ps(_mm_set_epi32({}, {}, {}, {}))); "
+        // VSQI.dest fs, (it++): fs is rd, it is rt.
+        return fmt::format("{{ uint32_t addr = {}; __m128i old_val = READ128(addr); "
+                           "__m128 res = _mm_blendv_ps(_mm_castsi128_ps(old_val), ctx->vu0_vf[{}], _mm_castsi128_ps({})); "
                            "WRITE128(addr, _mm_castps_si128(res)); "
-                           "ctx->vi[{}] = (ctx->vi[{}] + 1) & 0x3FF; }}",
-                           vis,
-                           inst.rt,
-                           (dest_mask & 0x1) ? -1 : 0, (dest_mask & 0x2) ? -1 : 0,
-                           (dest_mask & 0x4) ? -1 : 0, (dest_mask & 0x8) ? -1 : 0,
-                           vis, vis);
+                           "ctx->vi[{}] = static_cast<uint16_t>(ctx->vi[{}] + 1); }}",
+                           vu0QuadwordAddress(inst.rt), inst.rd, laneMask(inst.vectorInfo.vectorField), inst.rt,
+                           inst.rt);
     }
 
     std::string CodeGenerator::translateVU_VLQD(const Instruction &inst)
     {
-        uint8_t vis = inst.rd;
-        uint8_t dest_mask = inst.vectorInfo.vectorField;
-        return fmt::format("{{ ctx->vi[{}] = (ctx->vi[{}] - 1) & 0x3FF; "
-                           "uint32_t addr = ((uint32_t)(ctx->vi[{}] & 0x3FF)) << 4; "
-                           "__m128 res = _mm_castsi128_ps(READ128(addr)); "
-                           "__m128i mask = _mm_set_epi32({}, {}, {}, {}); "
-                           "ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], res, _mm_castsi128_ps(mask)); }}",
-                           vis, vis,
-                           vis,
-                           (dest_mask & 0x1) ? -1 : 0, (dest_mask & 0x2) ? -1 : 0,
-                           (dest_mask & 0x4) ? -1 : 0, (dest_mask & 0x8) ? -1 : 0,
-                           inst.rt, inst.rt);
+        // VLQD.dest ft, (--is): ft is rt, is is rd.
+        return fmt::format("{{ ctx->vi[{}] = static_cast<uint16_t>(ctx->vi[{}] - 1); "
+                           "__m128 res = _mm_castsi128_ps(READ128({})); "
+                           "ctx->vu0_vf[{}] = _mm_blendv_ps(ctx->vu0_vf[{}], res, _mm_castsi128_ps({})); }}",
+                           inst.rd, inst.rd, vu0QuadwordAddress(inst.rd), inst.rt, inst.rt,
+                           laneMask(inst.vectorInfo.vectorField));
     }
 
     std::string CodeGenerator::translateVU_VSQD(const Instruction &inst)
     {
-        uint8_t vis = inst.rd;
-        uint8_t dest_mask = inst.vectorInfo.vectorField;
-        return fmt::format("{{ ctx->vi[{}] = (ctx->vi[{}] - 1) & 0x3FF; "
-                           "uint32_t addr = ((uint32_t)(ctx->vi[{}] & 0x3FF)) << 4; "
-                           "__m128i old_val = READ128(addr); "
-                           "__m128 res = _mm_blendv_ps(_mm_castsi128_ps(old_val), ctx->vu0_vf[{}], _mm_castsi128_ps(_mm_set_epi32({}, {}, {}, {}))); "
+        // VSQD.dest fs, (--it): fs is rd, it is rt.
+        return fmt::format("{{ ctx->vi[{}] = static_cast<uint16_t>(ctx->vi[{}] - 1); "
+                           "uint32_t addr = {}; __m128i old_val = READ128(addr); "
+                           "__m128 res = _mm_blendv_ps(_mm_castsi128_ps(old_val), ctx->vu0_vf[{}], _mm_castsi128_ps({})); "
                            "WRITE128(addr, _mm_castps_si128(res)); }}",
-                           vis, vis,
-                           vis,
-                           inst.rt,
-                           (dest_mask & 0x1) ? -1 : 0, (dest_mask & 0x2) ? -1 : 0,
-                           (dest_mask & 0x4) ? -1 : 0, (dest_mask & 0x8) ? -1 : 0);
+                           inst.rt, inst.rt, vu0QuadwordAddress(inst.rt), inst.rd,
+                           laneMask(inst.vectorInfo.vectorField));
     }
 
     std::string CodeGenerator::translateVU_VRGET(const Instruction &inst)

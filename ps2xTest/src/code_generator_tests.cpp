@@ -1605,6 +1605,51 @@ void register_code_generator_tests()
             t.IsTrue(out.find("ctx->vi[20]") == std::string::npos, "S2 VLQI must not use rs(format) as VI index");
         });
 
+        tc.Run("VU0 S2 stores take the address from rt and the source from rd", [](TestCase &t) {
+            for (uint32_t op : {static_cast<uint32_t>(VU0_S2_VSQI), static_cast<uint32_t>(VU0_S2_VSQD)})
+            {
+                Instruction inst{};
+                inst.opcode = OPCODE_COP2;
+                inst.rs = COP2_CO | 0x4;
+                inst.rt = 3;  // it: the address
+                inst.rd = 12; // fs: the stored register
+                inst.function = 0x3C;
+                inst.vectorInfo.vectorField = 0xF;
+                inst.raw = (((op >> 2) & 0x1F) << 6) | (op & 0x3);
+
+                CodeGenerator gen({}, {});
+                std::string out = gen.translateInstruction(inst);
+
+                t.IsTrue(out.find("ctx->vi[3]") != std::string::npos, "VU0 store address VI should come from rt");
+                t.IsTrue(out.find("ctx->vu0_vf[12]") != std::string::npos, "VU0 store source VF should come from rd");
+                t.IsTrue(out.find("ctx->vi[12]") == std::string::npos, "VU0 store must not address with rd");
+            }
+        });
+
+        tc.Run("VU0 S2 memory ops address VU0 data memory", [](TestCase &t) {
+            for (uint32_t op : {static_cast<uint32_t>(VU0_S2_VLQI), static_cast<uint32_t>(VU0_S2_VSQI),
+                                static_cast<uint32_t>(VU0_S2_VLQD), static_cast<uint32_t>(VU0_S2_VSQD),
+                                static_cast<uint32_t>(VU0_S2_VILWR), static_cast<uint32_t>(VU0_S2_VISWR)})
+            {
+                Instruction inst{};
+                inst.opcode = OPCODE_COP2;
+                inst.rs = COP2_CO | 0x4;
+                inst.rt = 2;
+                inst.rd = 5;
+                inst.function = 0x3C;
+                inst.vectorInfo.vectorField = 0x4; // y
+                inst.raw = (((op >> 2) & 0x1F) << 6) | (op & 0x3);
+
+                CodeGenerator gen({}, {});
+                std::string out = gen.translateInstruction(inst);
+
+                t.IsTrue(out.find("0x11004000u") != std::string::npos, "VU0 memory ops must address VU0 data memory");
+                t.IsTrue(out.find("0xFFu") != std::string::npos, "VU0 memory addresses wrap at 4 KB");
+                if (op == VU0_S2_VILWR || op == VU0_S2_VISWR)
+                    t.IsTrue(out.find("+ 4u") != std::string::npos, "VILWR.y and VISWR.y use the y word");
+            }
+        });
+
         tc.Run("JAL to known function emits call and check", [](TestCase &t) {
             Function func;
             func.name = "jal_test";
