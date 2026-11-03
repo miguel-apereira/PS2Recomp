@@ -35,6 +35,24 @@ void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeByte
     m_queue.push_back(std::move(pkt));
 }
 
+void GifArbiter::submitAndDrain(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool path2DirectHl)
+{
+    if (!data || sizeBytes < 16)
+        return;
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    if (!m_processFn)
+        return;
+    if (m_queue.empty())
+    {
+        // Alone in the queue, it would be sent first anyway.
+        m_processFn(data, sizeBytes);
+        drain(); // anything the GS submitted meanwhile, on this thread
+        return;
+    }
+    submit(pathId, data, sizeBytes, path2DirectHl);
+    drain();
+}
+
 void GifArbiter::drain()
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
@@ -69,6 +87,10 @@ void GifArbiter::drain()
                 m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
             }
         }
+        // Give the storage back to the queue for the next packets.
+        packets.clear();
+        if (m_queue.empty())
+            m_queue.swap(packets);
     }
 }
 

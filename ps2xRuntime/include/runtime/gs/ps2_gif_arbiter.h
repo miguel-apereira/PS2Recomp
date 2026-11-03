@@ -43,6 +43,9 @@ public:
     void submit(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool path2DirectHl = false);
 
     void drain();
+    // submit then drain. With nothing else queued the packet goes straight
+    // to the GS, without a copy.
+    void submitAndDrain(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool path2DirectHl = false);
     bool empty() const
     {
         std::lock_guard<std::recursive_mutex> lock(m_mutex);
