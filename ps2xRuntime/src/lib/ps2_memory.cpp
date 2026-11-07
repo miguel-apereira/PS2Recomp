@@ -1177,7 +1177,8 @@ void PS2Memory::write128(uint32_t address, __m128i value)
 
 bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 {
-    if (address >= 0x10003000u && address < 0x10003100u) // GIF registers
+    // GIF registers; GIF_MODE is only kept here (GIF_STAT reads mirror it)
+    if (address >= 0x10003000u && address < 0x10003100u && !(m_path3Hook && address == 0x10003010u))
         syncGsAccess(GsSyncReason::GifRegister);
     if (address == 0x10003020u) // GIF_STAT: the FIFO count it may hold drains as time passes
         m_gifFifoCountSet = true;
@@ -2119,6 +2120,8 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t 
 
     if (pathId == GifPathId::Path3)
     {
+        if (m_path3Hook && m_path3Hook(data, sizeBytes, drainImmediately))
+            return;
         syncGsAccess(GsSyncReason::Path3);
         if (m_path3Masked)
         {
@@ -2449,7 +2452,8 @@ int PS2Memory::pollDmaRegisters()
 
 uint32_t PS2Memory::readIORegister(uint32_t address)
 {
-    if (address >= 0x10003000u && address < 0x10003100u) // GIF registers
+    // GIF registers; GIF_STAT is made from state kept here (and M3P, atomic)
+    if (address >= 0x10003000u && address < 0x10003100u && !(m_path3Hook && address == 0x10003020u))
         syncGsAccess(GsSyncReason::GifRegister);
     if (m_vif[0] && address >= 0x10003800u && address < 0x10003A00u)
     {

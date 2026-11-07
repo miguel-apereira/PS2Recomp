@@ -211,6 +211,16 @@ public:
     }
     uint32_t takePendingDmac() { return m_pendingDmac.exchange(0u, std::memory_order_acq_rel); }
 
+    // A host whose VIF1 thread sends the GS what it gets in order can take
+    // the EE's PATH3 packets too: the hook queues the packet behind what the
+    // EE sent VIF1 before it and returns true, and the EE goes on without
+    // waiting for that thread. It returns false where the packet must go to
+    // the GS here and now (on the host's own threads, which send them on).
+    // With the hook set, GIF_MODE writes and GIF_STAT reads don't wait for
+    // that thread either: they touch nothing it uses.
+    using Path3Hook = std::function<bool(const uint8_t *data, uint32_t sizeBytes, bool drainImmediately)>;
+    void setPath3Hook(Path3Hook hook) { m_path3Hook = std::move(hook); }
+
     using Vu1MscalCallback = std::function<void(uint32_t startPC, uint32_t top, uint32_t itop)>;
     void setVu1MscalCallback(Vu1MscalCallback cb) { m_vu1MscalCallback = std::move(cb); }
     using Vu1MscntCallback = std::function<void(uint32_t top, uint32_t itop)>;
@@ -301,6 +311,7 @@ public:
     uint32_t m_ipuOutWords[4] = {};
     std::atomic<uint32_t> m_pendingIntc{0};
     GsSyncHook m_gsSyncHook;
+    Path3Hook m_path3Hook;
     std::atomic<uint32_t> m_pendingDmac{0};
 
     void serviceIpu();
@@ -314,7 +325,7 @@ public:
     uint8_t *m_vu0Data = nullptr;
     uint8_t *m_vu1Code = nullptr;
     uint8_t *m_vu1Data = nullptr;
-    bool m_path3Masked = false;
+    std::atomic<bool> m_path3Masked{false}; // VIF1's thread sets it; GIF_STAT reads it
     uint32_t m_vif1PendingPath2ImageQwc = 0u;
     bool m_vif1PendingPath2DirectHl = false;
     std::vector<std::vector<uint8_t>> m_path3MaskedFifo;
