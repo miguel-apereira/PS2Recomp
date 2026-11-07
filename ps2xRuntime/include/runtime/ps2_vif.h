@@ -31,6 +31,11 @@ public:
 
     // True once per I bit or error: raise the VIF's interrupt (INTC 4 / 5).
     virtual bool takeInterrupt() = 0;
+
+    // True when the device takes any amount of data at once and never stalls
+    // its DMA (it keeps what it can't process yet): DMA then hands it each
+    // tag's data in one piece instead of a quadword at a time.
+    virtual bool takesBlocks() const { return false; }
 };
 
 #endif

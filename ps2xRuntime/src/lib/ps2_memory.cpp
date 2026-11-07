@@ -2900,9 +2900,33 @@ void PS2Memory::serviceVif(int unit)
         m_pendingDmac.fetch_or(1u << unit, std::memory_order_acq_rel);
         chainEnding = false;
     };
+    // Bytes from a DMA address to the end of the RAM or scratchpad it is in.
+    const auto bytesToEnd = [this](uint32_t address) -> uint32_t
+    {
+        if ((address & 0x80000000u) != 0u || isScratchpad(address))
+        {
+            return PS2_SCRATCHPAD_SIZE - (address & (PS2_SCRATCHPAD_SIZE - 16u));
+        }
+        const uint32_t physical = address & 0x01FFFFF0u;
+        return physical < PS2_RAM_SIZE ? PS2_RAM_SIZE - physical : 0u;
+    };
+    const bool blocks = vif->takesBlocks();
     // Sends QWC quadwords from MADR, as far as the VIF takes them.
     const auto sendData = [&]() -> bool
     {
+        if (blocks)
+        {
+            const uint32_t qwc = qwcReg & 0xFFFFu;
+            const uint32_t madr = madrReg;
+            const uint8_t *source = guestPointer(madr);
+            if (qwc != 0u && source && bytesToEnd(madr) >= qwc * 16u)
+            {
+                vif->pushData(reinterpret_cast<const uint32_t *>(source), qwc * 4u);
+                madrReg = madr + qwc * 16u;
+                qwcReg = 0u;
+                return true;
+            }
+        }
         while ((qwcReg & 0xFFFFu) != 0u)
         {
             if (vif->stalled())
