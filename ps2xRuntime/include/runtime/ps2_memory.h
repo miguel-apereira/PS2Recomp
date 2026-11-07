@@ -217,7 +217,8 @@ public:
     // waiting for that thread. It returns false where the packet must go to
     // the GS here and now (on the host's own threads, which send them on).
     // With the hook set, GIF_MODE writes and GIF_STAT reads don't wait for
-    // that thread either: they touch nothing it uses.
+    // that thread either: they touch nothing it uses. The EE no longer
+    // drains the GIF after its DMA then (the host drains after each packet).
     using Path3Hook = std::function<bool(const uint8_t *data, uint32_t sizeBytes, bool drainImmediately)>;
     void setPath3Hook(Path3Hook hook) { m_path3Hook = std::move(hook); }
 

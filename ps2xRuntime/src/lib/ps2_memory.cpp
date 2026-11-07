@@ -2029,7 +2029,9 @@ void PS2Memory::processPendingTransfers()
     }
     m_pendingVif1Transfers.clear();
 
-    if (m_gifArbiter)
+    // With a PATH3 hook the EE hands the GIF nothing here (the host's
+    // thread drains it after each packet), and that thread may be using it.
+    if (m_gifArbiter && !m_path3Hook)
         m_gifArbiter->drain();
 
     static constexpr uint32_t GIF_CHANNEL = 0x1000A000;
@@ -2120,7 +2122,9 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t 
 
     if (pathId == GifPathId::Path3)
     {
-        if (m_path3Hook && m_path3Hook(data, sizeBytes, drainImmediately))
+        // Queued packets drain when sent: the EE drains the GIF after its
+        // DMA anyway (processPendingTransfers), so nothing waits behind them.
+        if (m_path3Hook && m_path3Hook(data, sizeBytes, true))
             return;
         syncGsAccess(GsSyncReason::Path3);
         if (m_path3Masked)
