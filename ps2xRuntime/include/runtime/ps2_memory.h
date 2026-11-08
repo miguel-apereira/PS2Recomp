@@ -178,6 +178,13 @@ public:
     // (sync, then the download callback).
     using GsDownloadHook = std::function<bool(uint8_t *dst, uint32_t size)>;
     void setGsDownloadHook(GsDownloadHook hook) { m_gsDownloadHook = std::move(hook); }
+    // When set, an EE write to a display register (the privileged registers
+    // below CSR: PMODE ... BGCOLOR) takes no GS sync: the register takes the
+    // value at once (what the EE reads back), and the hook gets the register's
+    // offset from the GS privileged base and its new 64-bit value, for the host
+    // to pass on in order with the GS work queued before the write.
+    using GsDisplayWriteHook = std::function<void(uint32_t offset, uint64_t value)>;
+    void setGsDisplayWriteHook(GsDisplayWriteHook hook) { m_gsDisplayWriteHook = std::move(hook); }
 
     // Routes the IPU registers, FIFOs and DMA channels 3/4 to a host IPU.
     void setIpuDevice(PS2IpuDevice *device) { m_ipu = device; }
@@ -314,6 +321,7 @@ public:
     GifArbiter *m_gifArbiter = nullptr;
     GsDownloadCallback m_gsDownloadCallback;
     GsDownloadHook m_gsDownloadHook;
+    GsDisplayWriteHook m_gsDisplayWriteHook;
     PS2IpuDevice *m_ipu = nullptr;
     uint32_t m_ipuInWords[4] = {};
     uint32_t m_ipuOutWords[4] = {};

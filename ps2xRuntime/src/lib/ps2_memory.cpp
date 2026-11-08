@@ -988,9 +988,19 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
 
     if (isGsPrivReg(address))
     {
-        syncGsAccess(GsSyncReason::GsPrivWrite);
         uint32_t off = address & 7;
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
+        if (m_gsDisplayWriteHook && regOff < kGsCsrRegOffset)
+        {
+            if (uint64_t *reg = gsRegPtr(gs_regs, address))
+            {
+                const uint64_t mask = 0xFFFFFFFFULL << (off * 8);
+                *reg = (*reg & ~mask) | ((uint64_t)value << (off * 8));
+                m_gsDisplayWriteHook(regOff, *reg);
+            }
+            return;
+        }
+        syncGsAccess(GsSyncReason::GsPrivWrite);
         if (regOff == kGsCsrRegOffset)
         {
             // CSR: bits 0..1 of the low dword are write-one-to-clear status bits.
@@ -1049,8 +1059,17 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
 
     if (isGsPrivReg(address))
     {
-        syncGsAccess(GsSyncReason::GsPrivWrite);
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
+        if (m_gsDisplayWriteHook && regOff < kGsCsrRegOffset)
+        {
+            if (uint64_t *reg = gsRegPtr(gs_regs, address))
+            {
+                *reg = value;
+                m_gsDisplayWriteHook(regOff, value);
+            }
+            return;
+        }
+        syncGsAccess(GsSyncReason::GsPrivWrite);
         if (regOff == kGsCsrRegOffset)
         {
             // CSR: bits 0..1 are write-one-to-clear status bits. Done as a single
