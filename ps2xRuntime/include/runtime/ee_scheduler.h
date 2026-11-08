@@ -323,6 +323,15 @@ public:
     // VBlanks. On by default. May change while the guest runs.
     void setClockCatchUp(bool enabled) noexcept { m_clockCatchUp.store(enabled, std::memory_order_relaxed); }
     [[nodiscard]] bool clockCatchUp() const noexcept { return m_clockCatchUp.load(std::memory_order_relaxed); }
+    // Host time the EE spent stopped inside one of its own memory accesses,
+    // waiting for host work on another thread (a GS register write that waits
+    // for VU1 to finish the frame before it, for one). No checkpoint can run
+    // there, so with clock catch-up the next one counts that time as EE
+    // cycles, as the PS2's clock runs on while its EE stalls. It never takes
+    // the clock past real time (the host time of the next VBlank). Safe from
+    // a memory access; only the EE's own thread's stalls count.
+    void creditStall(std::chrono::nanoseconds waited) noexcept;
+    [[nodiscard]] bool onExecutorThread() const noexcept { return m_executorThread == std::this_thread::get_id(); }
 
     // Live controls for a host's developer tools, safe from any thread.
     // Pause: the EE stops at its next checkpoint, so the guest's threads,
@@ -344,6 +353,7 @@ public:
         uint64_t caughtUp = 0;  // VBlanks fired before the EE reached their cycles
         uint64_t skippedCycles = 0; // EE cycles they came early by
         uint64_t clockCycles = 0;   // EE cycles the clock moved on by (setClockCatchUp)
+        uint64_t stallCycles = 0;   // of those, for the EE's stalls (creditStall)
         uint64_t dropped = 0;   // VBlanks dropped because the host fell too far behind
     };
     // Counts since the last call.
@@ -447,6 +457,9 @@ private:
     void assertExecutor() const;
     // Moves the EE clock on by `cycles` the EE did not run (setClockCatchUp).
     void catchUpClock(uint64_t cycles);
+    // Counts the stalls creditStall noted as EE cycles, up to real time.
+    // Called with m_eventMutex held.
+    void applyStallCredit(std::chrono::steady_clock::time_point now);
     [[nodiscard]] int allocateThreadId();
     GuestThread &acquireInvocationThread();
     void enqueueReady(GuestThread &thread, bool front = false);
@@ -558,6 +571,8 @@ private:
     std::atomic<uint64_t> m_vblanksCaughtUp{0};
     std::atomic<uint64_t> m_cyclesSkipped{0};
     std::atomic<uint64_t> m_clockCyclesCaughtUp{0};
+    std::atomic<int64_t> m_pendingStallNs{0};
+    std::atomic<uint64_t> m_stallCyclesCredited{0};
     std::atomic<uint64_t> m_vblanksDropped{0};
 
     mutable std::mutex m_snapshotMutex;
