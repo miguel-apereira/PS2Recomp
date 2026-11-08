@@ -2956,13 +2956,17 @@ void PS2Memory::serviceVif(int unit)
 
     if (unit == 1 && (chcrReg & 0x101u) == 0x100u)
     {
-        syncGsAccess(GsSyncReason::GsDownload); // reads the GS
-
         const uint32_t qwc = qwcReg & 0xFFFFu;
         std::vector<uint8_t> data(static_cast<size_t>(qwc) * 16u, 0u);
-        if (m_gsDownloadCallback && !data.empty())
+        const bool hooked = m_gsDownloadHook && !data.empty() &&
+                            m_gsDownloadHook(data.data(), static_cast<uint32_t>(data.size()));
+        if (!hooked)
         {
-            m_gsDownloadCallback(data.data(), static_cast<uint32_t>(data.size()));
+            syncGsAccess(GsSyncReason::GsDownload); // reads the GS
+            if (m_gsDownloadCallback && !data.empty())
+            {
+                m_gsDownloadCallback(data.data(), static_cast<uint32_t>(data.size()));
+            }
         }
         for (uint32_t i = 0; i < qwc; ++i)
         {
