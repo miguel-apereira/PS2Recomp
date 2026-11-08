@@ -606,6 +606,22 @@ void register_ps2_runtime_interrupt_tests()
                      "the first VBlank should publish GS CSR.FIELD before resuming guest code");
         });
 
+        tc.Run("EE overclock divides the charges for guest code", [](TestCase &t)
+        {
+            TestEnv env;
+            EeScheduler &scheduler = env.runtime.eeScheduler();
+            t.Equals(scheduler.guestCycles(32u), 32u, "no overclock by default");
+            scheduler.setOverclock(200u);
+            t.Equals(scheduler.overclock(), 200u, "the overclock reads back");
+            t.Equals(scheduler.guestCycles(32u), 16u, "twice the speed: half the cycles");
+            t.Equals(scheduler.guestCycles(8u), 4u, "dispatches too");
+            scheduler.setOverclock(400u);
+            t.Equals(scheduler.guestCycles(32u), 8u, "four times the speed");
+            t.Equals(scheduler.guestCycles(1u), 1u, "never less than a cycle");
+            scheduler.setOverclock(100u);
+            t.Equals(scheduler.guestCycles(32u), 32u, "back to PS2 speed");
+        });
+
         tc.Run("VBlank waits for EE cycles when catch-up is off (slow host = slow motion)", [](TestCase &t)
         {
             TestEnv env;

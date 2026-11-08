@@ -1510,7 +1510,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     // Every inter-function transfer is also a deterministic EE safe point.
     // Backward edges inside generated functions use eeCheckpointDue(), while
     // this charge bounds straight-line call chains that have no local loop.
-    if (m_eeScheduler && m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles))
+    if (m_eeScheduler && m_eeScheduler->checkpointDue(m_eeScheduler->guestCycles(EeScheduler::kGuestDispatchCycles)))
     {
         ++g_guestUnwinds;
         return false;
@@ -2765,7 +2765,8 @@ namespace ps2_guest
 
     bool eeCheckpointDue(PS2Runtime *runtime, uint32_t cycles) noexcept
     {
-        return runtime->eeCheckpointDue(cycles);
+        // Generated code's own charge: scaled by the EE overclock.
+        return runtime->eeCheckpointDue(runtime->eeScheduler().guestCycles(cycles));
     }
 
     uint32_t readCop0Count(PS2Runtime *runtime, R5900Context *ctx) noexcept
