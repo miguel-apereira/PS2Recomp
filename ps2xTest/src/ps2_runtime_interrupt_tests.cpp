@@ -200,6 +200,48 @@ namespace
         scheduler.run();
     }
 
+    // A guest whose EE stands still in a memory access most of the time
+    // (a GS register write waiting for VU1): each pass runs 10,000 EE cycles
+    // after a 20 ms stall, and tells the scheduler about the stall or not.
+    bool g_creditStalls = false;
+
+    void stallingHostLoop(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        EeScheduler &scheduler = runtime->eeScheduler();
+        const auto start = std::chrono::steady_clock::now();
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        if (g_creditStalls)
+        {
+            scheduler.creditStall(std::chrono::steady_clock::now() - start);
+        }
+        scheduler.accountCycles(10000u);
+        ++g_slowHostPasses;
+        g_slowHostTicks = scheduler.currentVSyncTick();
+        if (std::chrono::steady_clock::now() - g_slowHostStart >= kSlowHostRun)
+        {
+            ctx->pc = 0u;
+            runtime->requestStop();
+            return;
+        }
+        ctx->pc = kSlowHostPc;
+    }
+
+    void runStallingHost(TestEnv &env, bool creditStalls)
+    {
+        env.runtime.registerFunction(kSlowHostPc, stallingHostLoop);
+        g_creditStalls = creditStalls;
+        g_slowHostTicks = 0u;
+        g_slowHostPasses = 0u;
+        R5900Context mainContext{};
+        mainContext.pc = kSlowHostPc;
+        EeScheduler &scheduler = env.runtime.eeScheduler();
+        scheduler.reset(env.rdram.data(), mainContext);
+        scheduler.setVBlankCatchUp(true);
+        scheduler.setClockCatchUp(true);
+        g_slowHostStart = std::chrono::steady_clock::now();
+        scheduler.run();
+    }
+
     void cleanupRuntime(TestEnv &env)
     {
         env.runtime.requestStop();
@@ -648,6 +690,30 @@ void register_ps2_runtime_interrupt_tests()
                      "the EE clock should keep up with the VBlanks");
             t.IsTrue(cycle <= g_slowHostPasses * kSlowHostPassCycles + (g_slowHostTicks + 1u) * 4916000ull,
                      "the EE clock should not run ahead of them");
+        });
+
+        tc.Run("EE stalls in memory accesses count in the EE clock, up to real time", [](TestCase &t)
+        {
+            TestEnv env;
+            runStallingHost(env, true);
+            const auto elapsed = std::chrono::steady_clock::now() - g_slowHostStart;
+            const EeScheduler::VBlankCatchUpStats stats = env.runtime.eeScheduler().takeVBlankCatchUpStats();
+            t.IsTrue(stats.stallCycles > 0u, "the stalls should be counted");
+            t.IsTrue(g_slowHostTicks >= 9u, "the VBlanks should keep host time (12 in 200 ms)");
+            const double realCycles = std::chrono::duration<double>(elapsed).count() *
+                                      static_cast<double>(EeScheduler::kEeClockHz);
+            const auto cycle = static_cast<double>(env.runtime.eeScheduler().eeCycle());
+            t.IsTrue(cycle >= 0.75 * realCycles, "the EE clock should keep up with real time");
+            t.IsTrue(cycle <= realCycles + 4916000.0, "the EE clock should not run ahead of real time");
+        });
+
+        tc.Run("Without stall credit, an EE stalled in memory accesses holds the VBlanks back", [](TestCase &t)
+        {
+            TestEnv env;
+            runStallingHost(env, false);
+            const EeScheduler::VBlankCatchUpStats stats = env.runtime.eeScheduler().takeVBlankCatchUpStats();
+            t.Equals(stats.stallCycles, 0ull, "nothing to count");
+            t.IsTrue(g_slowHostTicks <= 6u, "VBlanks wait for the EE's own cycles between them");
         });
 
         tc.Run("VBlank catch-up without clock catch-up does not jump the EE clock", [](TestCase &t)

@@ -153,6 +153,7 @@ EeScheduler::VBlankCatchUpStats EeScheduler::takeVBlankCatchUpStats() noexcept
     stats.caughtUp = m_vblanksCaughtUp.exchange(0u, std::memory_order_relaxed);
     stats.skippedCycles = m_cyclesSkipped.exchange(0u, std::memory_order_relaxed);
     stats.clockCycles = m_clockCyclesCaughtUp.exchange(0u, std::memory_order_relaxed);
+    stats.stallCycles = m_stallCyclesCredited.exchange(0u, std::memory_order_relaxed);
     stats.dropped = m_vblanksDropped.exchange(0u, std::memory_order_relaxed);
     return stats;
 }
@@ -245,6 +246,7 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     m_vblanksCaughtUp.store(0u, std::memory_order_relaxed);
     m_cyclesSkipped.store(0u, std::memory_order_relaxed);
     m_vblanksDropped.store(0u, std::memory_order_relaxed);
+    m_pendingStallNs.store(0, std::memory_order_relaxed);
     m_debugPublishCountdown = 0u;
     {
         std::lock_guard lock(m_eventMutex);
@@ -642,6 +644,56 @@ void EeScheduler::catchUpClock(uint64_t cycles)
         const uint32_t step = static_cast<uint32_t>(std::min<uint64_t>(cycles, std::numeric_limits<uint32_t>::max()));
         accountCycles(step);
         cycles -= step;
+    }
+}
+
+void EeScheduler::creditStall(std::chrono::nanoseconds waited) noexcept
+{
+    if (waited.count() <= 0 || !onExecutorThread())
+    {
+        return;
+    }
+    m_pendingStallNs.fetch_add(waited.count(), std::memory_order_relaxed);
+    m_checkpointPending.store(true, std::memory_order_release);
+}
+
+void EeScheduler::applyStallCredit(std::chrono::steady_clock::time_point now)
+{
+    const int64_t stallNs = m_pendingStallNs.exchange(0, std::memory_order_relaxed);
+    const float speed = m_speed.load(std::memory_order_relaxed);
+    if (stallNs <= 0 || speed <= 0.0f || !m_clockCatchUp.load(std::memory_order_relaxed))
+    {
+        return;
+    }
+    // Real time in EE cycles, from the next VBlank: the cycle it is due at,
+    // less the host time still to go before it (or plus the time it is late).
+    const ScheduledEvent *vblank = nullptr;
+    for (const ScheduledEvent &item : m_deadlines)
+    {
+        if (item.event.type == EeEventType::VBlankStart &&
+            (vblank == nullptr || item.hostDeadline < vblank->hostDeadline))
+        {
+            vblank = &item;
+        }
+    }
+    if (vblank == nullptr)
+    {
+        return;
+    }
+    const double rate = static_cast<double>(speed) * static_cast<double>(kEeClockHz) * 1e-9;
+    const double due = static_cast<double>(vblank->early ? vblank->dueCycle : vblank->deadlineCycle);
+    const double ahead = static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(vblank->hostDeadline - now).count());
+    const double realTime = due - ahead * rate;
+    if (realTime <= static_cast<double>(m_eeCycle))
+    {
+        return;
+    }
+    const double stall = static_cast<double>(stallNs) * rate;
+    const uint64_t cycles = static_cast<uint64_t>(std::min(stall, realTime - static_cast<double>(m_eeCycle)));
+    if (cycles > 0u)
+    {
+        m_stallCyclesCredited.fetch_add(cycles, std::memory_order_relaxed);
+        catchUpClock(cycles);
     }
 }
 
@@ -2131,6 +2183,9 @@ void EeScheduler::processDueDeadlines()
             const auto now = std::chrono::steady_clock::now();
             if (catchUp)
             {
+                // The time the EE stood still in a memory access passed in
+                // the guest's time too.
+                applyStallCredit(now);
                 // A VBlank whose host time has passed comes early instead of
                 // waiting for its EE cycles, once the EE has run a little
                 // since the last one. The EE clock itself never jumps, so
