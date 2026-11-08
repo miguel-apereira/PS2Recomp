@@ -172,6 +172,12 @@ public:
     // returns how many it read. VIF1 DMA to memory (CHCR.DIR = 0) uses it.
     using GsDownloadCallback = std::function<uint32_t(uint8_t *dst, uint32_t size)>;
     void setGsDownloadCallback(GsDownloadCallback cb) { m_gsDownloadCallback = std::move(cb); }
+    // A host can serve a VIF1 download itself (a late read-back, say): the
+    // hook fills dst (size bytes, zeroed) and returns true, and the EE goes
+    // on without waiting for the host's VIF1 thread. False: the usual way
+    // (sync, then the download callback).
+    using GsDownloadHook = std::function<bool(uint8_t *dst, uint32_t size)>;
+    void setGsDownloadHook(GsDownloadHook hook) { m_gsDownloadHook = std::move(hook); }
 
     // Routes the IPU registers, FIFOs and DMA channels 3/4 to a host IPU.
     void setIpuDevice(PS2IpuDevice *device) { m_ipu = device; }
@@ -307,6 +313,7 @@ public:
     GifPacketCallback m_gifPacketCallback;
     GifArbiter *m_gifArbiter = nullptr;
     GsDownloadCallback m_gsDownloadCallback;
+    GsDownloadHook m_gsDownloadHook;
     PS2IpuDevice *m_ipu = nullptr;
     uint32_t m_ipuInWords[4] = {};
     uint32_t m_ipuOutWords[4] = {};
