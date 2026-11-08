@@ -447,7 +447,7 @@ void EeScheduler::run()
         }
         PS2Runtime::RecompiledFunction function = m_runtime.lookupFunction(context.pc);
 
-        if (checkpointDue(kGuestDispatchCycles))
+        if (checkpointDue(guestCycles(kGuestDispatchCycles)))
         {
             continue;
         }

@@ -2,6 +2,7 @@
 
 #include "ps2_runtime.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -280,6 +281,27 @@ public:
     void postEvent(EeEvent event);
     [[nodiscard]] bool checkpointDue(uint32_t cycles = kGeneratedCheckpointCycles) noexcept;
     void accountCycles(uint32_t cycles) noexcept;
+    // EE overclock, in percent of the PS2's speed (100: none). The fixed
+    // charges for guest code (loop iterations, dispatches) are divided by
+    // it, so the guest gets that much more work done per frame: a game
+    // that slows down on a PS2 when its frame takes too long no longer
+    // does, as long as the host keeps up. The clock itself still runs at
+    // the PS2's rate (VBlanks, timers and the IOP keep real time). May
+    // change while the guest runs.
+    void setOverclock(uint32_t percent) noexcept
+    {
+        percent = std::clamp(percent, 25u, 800u);
+        m_guestCycleScale.store((256u * 100u + percent / 2u) / percent, std::memory_order_relaxed);
+    }
+    [[nodiscard]] uint32_t overclock() const noexcept
+    {
+        return (256u * 100u) / std::max(1u, m_guestCycleScale.load(std::memory_order_relaxed));
+    }
+    // The cycles to charge guest code that ran `cycles` PS2 cycles' worth (setOverclock).
+    [[nodiscard]] uint32_t guestCycles(uint32_t cycles) const noexcept
+    {
+        return std::max(1u, (cycles * m_guestCycleScale.load(std::memory_order_relaxed)) >> 8);
+    }
     [[nodiscard]] bool isExecutingGuest() const noexcept;
     // EE cycles accounted so far (COP0 Count runs from these).
     [[nodiscard]] uint64_t eeCycle() const noexcept { return m_eeCycle; }
@@ -520,6 +542,7 @@ private:
 
     std::atomic<bool> m_vblankCatchUp{false};
     std::atomic<bool> m_clockCatchUp{true};
+    std::atomic<uint32_t> m_guestCycleScale{256u}; // setOverclock: 256 = PS2 speed
     std::atomic<float> m_speed{1.0f};
     std::atomic<bool> m_pauseRequested{false};
     std::atomic<bool> m_pausedNow{false};
