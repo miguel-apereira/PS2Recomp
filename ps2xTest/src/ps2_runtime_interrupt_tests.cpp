@@ -183,7 +183,7 @@ namespace
         ctx->pc = kSlowHostPc;
     }
 
-    void runSlowHost(TestEnv &env, bool catchUp)
+    void runSlowHost(TestEnv &env, bool catchUp, bool clockCatchUp = true)
     {
         env.runtime.registerFunction(kSlowHostPc, slowHostLoop);
         g_slowHostTicks = 0u;
@@ -195,6 +195,7 @@ namespace
         EeScheduler &scheduler = env.runtime.eeScheduler();
         scheduler.reset(env.rdram.data(), mainContext);
         scheduler.setVBlankCatchUp(catchUp);
+        scheduler.setClockCatchUp(clockCatchUp);
         g_slowHostStart = std::chrono::steady_clock::now();
         scheduler.run();
     }
@@ -613,10 +614,30 @@ void register_ps2_runtime_interrupt_tests()
             t.IsTrue(g_slowHostTicks <= 5u, "VBlanks should follow the EE's cycles");
         });
 
-        tc.Run("VBlank catch-up keeps host time when the EE falls behind, without jumping the EE clock", [](TestCase &t)
+        tc.Run("VBlank catch-up keeps host time when the EE falls behind; the EE clock catches up at each early VBlank",
+               [](TestCase &t)
         {
             TestEnv env;
             runSlowHost(env, true);
+            const EeScheduler::VBlankCatchUpStats stats = env.runtime.eeScheduler().takeVBlankCatchUpStats();
+            t.IsTrue(g_slowHostTicks >= 9u && g_slowHostTicks <= 12u, "VBlanks should follow host time (12 in 200 ms)");
+            t.IsTrue(stats.caughtUp >= 6u, "most VBlanks should come early");
+            t.IsTrue(stats.clockCycles > 0u, "the EE clock should move on at the early VBlanks");
+            t.Equals(stats.dropped, 0ull, "nothing should be dropped this close to host time");
+            // The clock stands at a VBlank's own cycle after each one: about
+            // one VBlank period (4.9M cycles) per tick, not the third of it
+            // the guest ran.
+            const uint64_t cycle = env.runtime.eeScheduler().eeCycle();
+            t.IsTrue(cycle >= (g_slowHostTicks - 1u) * 4900000ull,
+                     "the EE clock should keep up with the VBlanks");
+            t.IsTrue(cycle <= g_slowHostPasses * kSlowHostPassCycles + (g_slowHostTicks + 1u) * 4916000ull,
+                     "the EE clock should not run ahead of them");
+        });
+
+        tc.Run("VBlank catch-up without clock catch-up does not jump the EE clock", [](TestCase &t)
+        {
+            TestEnv env;
+            runSlowHost(env, true, false);
             const EeScheduler::VBlankCatchUpStats stats = env.runtime.eeScheduler().takeVBlankCatchUpStats();
             t.IsTrue(g_slowHostTicks >= 9u && g_slowHostTicks <= 12u, "VBlanks should follow host time (12 in 200 ms)");
             t.IsTrue(stats.caughtUp >= 6u, "most VBlanks should come early");

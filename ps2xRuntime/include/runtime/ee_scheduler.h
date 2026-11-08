@@ -289,10 +289,18 @@ public:
     // slow motion. On: once a VBlank's host time has passed it fires without
     // waiting for the rest of its EE cycles (after at least an eighth of a
     // frame of EE time since the last one), so a slow host drops frames
-    // instead and the game keeps real time. The EE clock does not jump.
-    // May change while the guest runs.
+    // instead and the game keeps real time. May change while the guest runs.
     void setVBlankCatchUp(bool enabled) noexcept { m_vblankCatchUp.store(enabled, std::memory_order_relaxed); }
     [[nodiscard]] bool vblankCatchUp() const noexcept { return m_vblankCatchUp.load(std::memory_order_relaxed); }
+    // With VBlank catch-up, the EE clock (EE timers, COP0 Count, the IOP)
+    // keeps real time too: host time the EE spends idle counts as EE cycles
+    // even when an event wakes it before its next deadline, and a VBlank that
+    // came early moves the clock on to the cycle it was due at. Off: the EE
+    // clock only counts the cycles the EE ran, so while the EE waits for host
+    // work (or idles between events) everything timed by it falls behind the
+    // VBlanks. On by default. May change while the guest runs.
+    void setClockCatchUp(bool enabled) noexcept { m_clockCatchUp.store(enabled, std::memory_order_relaxed); }
+    [[nodiscard]] bool clockCatchUp() const noexcept { return m_clockCatchUp.load(std::memory_order_relaxed); }
 
     // Live controls for a host's developer tools, safe from any thread.
     // Pause: the EE stops at its next checkpoint, so the guest's threads,
@@ -313,6 +321,7 @@ public:
     {
         uint64_t caughtUp = 0;  // VBlanks fired before the EE reached their cycles
         uint64_t skippedCycles = 0; // EE cycles they came early by
+        uint64_t clockCycles = 0;   // EE cycles the clock moved on by (setClockCatchUp)
         uint64_t dropped = 0;   // VBlanks dropped because the host fell too far behind
     };
     // Counts since the last call.
@@ -410,9 +419,12 @@ private:
         EeEvent event{};
         uint64_t sequence = 0;
         bool early = false; // brought forward by VBlank catch-up
+        uint64_t dueCycle = 0; // early: the cycle it was due at before that
     };
 
     void assertExecutor() const;
+    // Moves the EE clock on by `cycles` the EE did not run (setClockCatchUp).
+    void catchUpClock(uint64_t cycles);
     [[nodiscard]] int allocateThreadId();
     GuestThread &acquireInvocationThread();
     void enqueueReady(GuestThread &thread, bool front = false);
@@ -507,6 +519,7 @@ private:
     std::atomic<uint64_t> m_nextDeadlineCycle{0};
 
     std::atomic<bool> m_vblankCatchUp{false};
+    std::atomic<bool> m_clockCatchUp{true};
     std::atomic<float> m_speed{1.0f};
     std::atomic<bool> m_pauseRequested{false};
     std::atomic<bool> m_pausedNow{false};
@@ -521,6 +534,7 @@ private:
     std::atomic<bool> m_hostDeadlineDue{false};
     std::atomic<uint64_t> m_vblanksCaughtUp{0};
     std::atomic<uint64_t> m_cyclesSkipped{0};
+    std::atomic<uint64_t> m_clockCyclesCaughtUp{0};
     std::atomic<uint64_t> m_vblanksDropped{0};
 
     mutable std::mutex m_snapshotMutex;
