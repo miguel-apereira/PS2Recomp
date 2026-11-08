@@ -185,6 +185,13 @@ public:
     // to pass on in order with the GS work queued before the write.
     using GsDisplayWriteHook = std::function<void(uint32_t offset, uint64_t value)>;
     void setGsDisplayWriteHook(GsDisplayWriteHook hook) { m_gsDisplayWriteHook = std::move(hook); }
+    // When on, an EE write to CSR that only clears event bits (SIGNAL,
+    // FINISH, HSINT, VSINT, EDWINT) and any write to IMR take no GS sync:
+    // they apply at once (CSR as an atomic read-modify-write), as an interrupt
+    // handler's acknowledge does. Events the GS work queued before the write
+    // raises later set their bits again then. For a host that drains GS
+    // events itself (frame pipelining, say); off by default.
+    void setGsEventWritesUnsynced(bool on) { m_gsEventWritesUnsynced = on; }
 
     // Routes the IPU registers, FIFOs and DMA channels 3/4 to a host IPU.
     void setIpuDevice(PS2IpuDevice *device) { m_ipu = device; }
@@ -322,6 +329,7 @@ public:
     GsDownloadCallback m_gsDownloadCallback;
     GsDownloadHook m_gsDownloadHook;
     GsDisplayWriteHook m_gsDisplayWriteHook;
+    bool m_gsEventWritesUnsynced = false;
     PS2IpuDevice *m_ipu = nullptr;
     uint32_t m_ipuInWords[4] = {};
     uint32_t m_ipuOutWords[4] = {};

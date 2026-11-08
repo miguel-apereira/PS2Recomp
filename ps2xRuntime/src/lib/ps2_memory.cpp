@@ -98,6 +98,8 @@ namespace
     }
 
     constexpr uint32_t kGsCsrRegOffset = 0x1000u;
+    constexpr uint32_t kGsImrRegOffset = 0x1010u;
+    constexpr uint64_t kGsCsrEventBits = 0x1Full; // SIGNAL FINISH HSINT VSINT EDWINT (write one to clear)
 
     // Atomically apply a 32-bit write to one half (off=0 low dword, off=4 high
     // dword) of the GS CSR register. Bits 0..1 of the low dword (SIGNAL/FINISH) are
@@ -1000,6 +1002,25 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
             }
             return;
         }
+        if (m_gsEventWritesUnsynced)
+        {
+            // See setGsEventWritesUnsynced.
+            if (regOff == kGsCsrRegOffset &&
+                (off == 0 ? (value & ~static_cast<uint32_t>(kGsCsrEventBits)) == 0u : value == 0u))
+            {
+                writeCsrHalf(gs_regs.csr, off, value);
+                return;
+            }
+            if (regOff == kGsImrRegOffset)
+            {
+                if (uint64_t *reg = gsRegPtr(gs_regs, address))
+                {
+                    const uint64_t mask = 0xFFFFFFFFULL << (off * 8);
+                    *reg = (*reg & ~mask) | ((uint64_t)value << (off * 8));
+                }
+                return;
+            }
+        }
         syncGsAccess(GsSyncReason::GsPrivWrite);
         if (regOff == kGsCsrRegOffset)
         {
@@ -1068,6 +1089,21 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
                 m_gsDisplayWriteHook(regOff, value);
             }
             return;
+        }
+        if (m_gsEventWritesUnsynced)
+        {
+            // See setGsEventWritesUnsynced.
+            if (regOff == kGsCsrRegOffset && (value & ~kGsCsrEventBits) == 0u)
+            {
+                writeCsrFull(gs_regs.csr, value);
+                return;
+            }
+            if (regOff == kGsImrRegOffset)
+            {
+                if (uint64_t *reg = gsRegPtr(gs_regs, address))
+                    *reg = value;
+                return;
+            }
         }
         syncGsAccess(GsSyncReason::GsPrivWrite);
         if (regOff == kGsCsrRegOffset)
