@@ -261,6 +261,8 @@ class EeScheduler
 {
 public:
     static constexpr int kMainThreadId = 1;
+    // Unwinds to the dispatcher (C++ exceptions) since the last call.
+    static uint64_t takeTransfers() noexcept;
     static constexpr int kFirstThreadId = 2;
     static constexpr int kLastThreadId = 255;
     static constexpr int kPriorityCount = 128;

@@ -1470,10 +1470,17 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
 
     // Debugging aid: TGR_TRACE_CALLS="0x1ED878,0x1EDE48" logs calls to those
-    // guest functions (caller and a0-a3), up to 64 times each.
-    static const std::unordered_map<uint32_t, int> *traced = []
+    // guest functions (caller and a0-a3), up to 64 times each. One static (one
+    // guard check a call): this runs for every guest call.
+    struct CallTrace
     {
-        auto *targets = new std::unordered_map<uint32_t, int>();
+        std::unordered_map<uint32_t, int> targets;
+        std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+        long long afterMs = 0;
+    };
+    static CallTrace *const trace = []
+    {
+        auto *t = new CallTrace();
         if (const char *list = std::getenv("TGR_TRACE_CALLS"))
         {
             for (const char *cursor = list; *cursor;)
@@ -1482,24 +1489,20 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                 const unsigned long value = std::strtoul(cursor, &end, 0);
                 if (end == cursor)
                     break;
-                (*targets)[static_cast<uint32_t>(value)] = 0;
+                t->targets[static_cast<uint32_t>(value)] = 0;
                 cursor = (*end == ',') ? end + 1 : end;
             }
         }
-        return targets;
+        if (const char *after = std::getenv("TGR_TRACE_AFTER_MS"))
+            t->afterMs = std::atoll(after);
+        return t;
     }();
-    static const auto traceStart = std::chrono::steady_clock::now();
-    static const long long traceAfterMs = []
+    if (isCall && !trace->targets.empty() &&
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - trace->start).count() >=
+            trace->afterMs)
     {
-        const char *after = std::getenv("TGR_TRACE_AFTER_MS");
-        return after ? std::atoll(after) : 0LL;
-    }();
-    if (isCall && !traced->empty() &&
-        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - traceStart).count() >=
-            traceAfterMs)
-    {
-        auto it = const_cast<std::unordered_map<uint32_t, int> *>(traced)->find(targetPc);
-        if (it != traced->end() && it->second++ < 64)
+        auto it = trace->targets.find(targetPc);
+        if (it != trace->targets.end() && it->second++ < 64)
         {
             std::cerr << "[call] 0x" << std::hex << targetPc << " from 0x" << sourcePc << " a0=0x" << GPR_U32(ctx, 4)
                       << " a1=0x" << GPR_U32(ctx, 5) << " a2=0x" << GPR_U32(ctx, 6) << " a3=0x" << GPR_U32(ctx, 7)
@@ -1528,7 +1531,11 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         return false;
     }
 
-    if (!hasFunction(targetPc))
+    // One look in the function table (hasFunction then lookupFunction looked twice).
+    uint32_t targetSlot = 0u;
+    const RecompiledFunction targetFn =
+        generatedFunctionTableSlot(targetPc, targetSlot) ? g_ps2RecompiledFunctionTable[targetSlot] : nullptr;
+    if (targetFn == nullptr)
     {
         reportMissingFunction(rdram, ctx, targetPc, sourcePc, kind, debugName);
 
@@ -1552,7 +1559,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         return false;
     }
 
-    RecompiledFunction targetFn = lookupFunction(targetPc);
+    pushDispatchPc(targetPc);
     const uint32_t entryPc = ctx->pc;
     const uint64_t unwindsBefore = g_guestUnwinds;
     targetFn(rdram, ctx, this);

@@ -13,6 +13,15 @@
 #include <bit>
 #include <stdexcept>
 
+// Host stack unwinds to the dispatcher (EeDispatcherTransfer, a C++ exception
+// each): thread switches, blocking waits, interrupt invocations. For stats.
+std::atomic<uint64_t> g_eeTransfers{0};
+
+uint64_t EeScheduler::takeTransfers() noexcept
+{
+    return g_eeTransfers.exchange(0, std::memory_order_relaxed);
+}
+
 namespace
 {
     // Diagnostics for a guest thread that ends unexpectedly (its PC reaches 0
@@ -845,6 +854,7 @@ int EeScheduler::startThread(int id, uint32_t arg, const R5900Context &caller, b
         m_runtime.guestFree(ownedStack);
     }
     publishSnapshot();
+    g_eeTransfers.fetch_add(1, std::memory_order_relaxed);
     throw EeDispatcherTransfer{};
 }
 
@@ -1135,6 +1145,7 @@ void EeScheduler::transferIfRequested(bool interruptSafe)
     m_rescheduleRequested = false;
     m_timeSliceExpired = false;
     publishSnapshot();
+    g_eeTransfers.fetch_add(1, std::memory_order_relaxed);
     throw EeDispatcherTransfer{};
 }
 
@@ -1439,6 +1450,7 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
     invocation.sequence = ++m_invocationSequence;
     owner->invocations.push_back(std::move(invocation));
     publishSnapshot();
+    g_eeTransfers.fetch_add(1, std::memory_order_relaxed);
     throw EeDispatcherTransfer{};
 }
 
@@ -1459,6 +1471,7 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
         owner->invocations.push_back(std::move(*it));
     }
     publishSnapshot();
+    g_eeTransfers.fetch_add(1, std::memory_order_relaxed);
     throw EeDispatcherTransfer{};
 }
 
@@ -2045,6 +2058,7 @@ void EeScheduler::blockCurrent(EeWaitState wait)
     self->status = self->suspendCount == 0 ? EeThreadStatus::Waiting : EeThreadStatus::WaitingSuspended;
     m_currentThreadId = 0;
     publishSnapshot();
+    g_eeTransfers.fetch_add(1, std::memory_order_relaxed);
     throw EeDispatcherTransfer{};
 }
 
