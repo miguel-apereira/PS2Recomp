@@ -374,6 +374,7 @@ public:
     std::atomic<uint64_t> m_vu1CodeGeneration{0};
     // I/O registers
     IoRegisterFile m_ioRegisters;
+    size_t m_chainBytesHint = 4096; // bytes to reserve for the next DMA chain (the last one's, and a quarter)
 
     // Registers
     GSRegisters gs_regs;

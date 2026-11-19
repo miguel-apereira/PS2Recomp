@@ -1547,6 +1547,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     // A guard against chains that loop forever, far above any real frame.
                     const int kMaxChainTags = 1 << 20;
                     std::vector<uint8_t> chainBuf;
+                    // Room for a chain like the last one: no reallocation (and copy) while it grows.
+                    chainBuf.reserve(m_chainBytesHint);
 
                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
                     {
@@ -1729,6 +1731,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     chcr = (chcr & 0x0000FFFFu) | (lastTagUpper << 16);
                     m_ioRegisters[channelBase + 0x00] = chcr;
 
+                    m_chainBytesHint = std::max<size_t>(chainBuf.size() + chainBuf.size() / 4u, 4096u);
                     if (!chainBuf.empty())
                     {
                         PendingTransfer pt;
