@@ -281,39 +281,53 @@ public:
     void run();
     void requestStop();
     void postEvent(EeEvent event);
-    // At every guest call and loop edge: inline, so the common case (nothing
-    // due) costs a few loads and compares; the end of a time slice goes out
-    // of line.
+    // At every guest call and loop edge. The common case is one add and one
+    // compare: m_fastUntil is the EE cycle up to which nothing can be due (the
+    // next deadline, the end of the time slice, the next EE timer interrupt,
+    // at most kAccountStrideCycles on); anything that may make a checkpoint
+    // due sooner (raiseCheckpoint, a new deadline, a new slice) clears it.
+    // The EE timers and the IOP get their cycles in the slow path.
     [[nodiscard]] bool checkpointDue(uint32_t cycles = kGeneratedCheckpointCycles) noexcept
     {
-        accountCycles(cycles);
-        if (m_checkpointPending.load(std::memory_order_acquire) || m_stopRequested.load(std::memory_order_acquire))
-        {
-            return true;
-        }
-        const uint64_t nextEventCycle = m_nextDeadlineCycle.load(std::memory_order_acquire);
-        if (nextEventCycle != 0u && m_eeCycle >= nextEventCycle)
-        {
-            m_checkpointPending.store(true, std::memory_order_release);
-            return true;
-        }
-        if (m_eeCycle < m_sliceEndCycle)
+        m_eeCycle += std::max<uint32_t>(1u, cycles);
+        if (m_eeCycle < m_fastUntil.load(std::memory_order_relaxed)) [[likely]]
         {
             return false;
         }
-        return sliceEnded();
+        return checkpointSlow();
     }
+    // Charges cycles and hands them to the EE timers and the IOP now.
     void accountCycles(uint32_t cycles) noexcept
     {
-        const uint64_t elapsed = std::max<uint64_t>(1u, cycles);
-        m_eeCycle += elapsed;
-        m_pendingEeTimerInterrupts |= m_runtime.memory().advanceEeTimers(elapsed);
-        m_runtime.advanceIopEeCycles(elapsed);
+        m_eeCycle += std::max<uint32_t>(1u, cycles);
+        flushAccounting();
+    }
+    // The EE cycles charged since the last call go to the EE timers and the IOP.
+    void flushAccounting() noexcept
+    {
+        const uint64_t pending = m_eeCycle - m_accountedCycle;
+        if (pending == 0u)
+        {
+            return;
+        }
+        m_accountedCycle = m_eeCycle;
+        m_pendingEeTimerInterrupts |= m_runtime.memory().advanceEeTimers(pending);
+        m_runtime.advanceIopEeCycles(pending);
         if (m_pendingEeTimerInterrupts != 0u)
         {
-            m_checkpointPending.store(true, std::memory_order_release);
+            raiseCheckpoint();
         }
     }
+    // A checkpoint is due at the next guest checkpoint (any thread).
+    void raiseCheckpoint() noexcept
+    {
+        m_checkpointPending.store(true, std::memory_order_seq_cst);
+        m_fastUntil.store(0u, std::memory_order_seq_cst);
+    }
+    // EE cycles the timers and the IOP may lag behind before the slow path runs.
+    static constexpr uint64_t kAccountStrideCycles = 256u;
+    // checkpointDue past m_fastUntil: accounting, then the full check.
+    [[nodiscard]] bool checkpointSlow() noexcept;
     // checkpointDue at the end of a time slice: a reschedule, or a new slice.
     [[nodiscard]] bool sliceEnded() noexcept;
     // EE overclock, in percent of the PS2's speed (100: none). The fixed
@@ -574,6 +588,10 @@ private:
     std::atomic<bool> m_guestExecuting{false};
     std::atomic<bool> m_stopRequested{false};
     std::atomic<bool> m_checkpointPending{false};
+    // See checkpointDue. Its own cache line: other threads clear it, the EE
+    // reads it at every checkpoint.
+    alignas(64) std::atomic<uint64_t> m_fastUntil{0};
+    uint64_t m_accountedCycle = 0; // EE cycles the timers and the IOP have had
     uint32_t m_debugPublishCountdown = 0u;
     // VU0's registers and COP2 control registers belong to the chip, not to
     // a thread: the EE kernel does not switch them, interrupt handlers see

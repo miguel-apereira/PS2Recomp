@@ -199,7 +199,7 @@ void EeScheduler::runPacer()
             // cycles yet, the next checkpoint brings it forward.
             flagged = deadline;
             m_hostDeadlineDue.store(true, std::memory_order_release);
-            m_checkpointPending.store(true, std::memory_order_release);
+            raiseCheckpoint();
         }
     }
 }
@@ -285,6 +285,8 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     m_pendingEeTimerInterrupts = 0u;
     m_gsIrqRaised = 0u;
     m_eeCycle = 0u;
+    m_accountedCycle = 0u;
+    m_fastUntil.store(0u, std::memory_order_seq_cst);
     m_sliceEndCycle = kDefaultTimeSliceCycles;
     m_stopRequested.store(false, std::memory_order_release);
     m_checkpointPending.store(false, std::memory_order_release);
@@ -578,7 +580,7 @@ void EeScheduler::run()
 void EeScheduler::requestStop()
 {
     m_stopRequested.store(true, std::memory_order_release);
-    m_checkpointPending.store(true, std::memory_order_release);
+    raiseCheckpoint();
     m_eventCv.notify_all();
 }
 
@@ -589,7 +591,7 @@ void EeScheduler::setPaused(bool paused)
         m_pauseRequested.store(paused, std::memory_order_release);
         if (paused)
         {
-            m_checkpointPending.store(true, std::memory_order_release);
+            raiseCheckpoint();
         }
         else
         {
@@ -644,9 +646,44 @@ void EeScheduler::postEvent(EeEvent event)
     {
         std::lock_guard lock(m_eventMutex);
         m_events.push_back(event);
-        m_checkpointPending.store(true, std::memory_order_release);
+        raiseCheckpoint();
     }
     m_eventCv.notify_one();
+}
+
+bool EeScheduler::checkpointSlow() noexcept
+{
+    flushAccounting();
+    if (m_checkpointPending.load(std::memory_order_acquire) || m_stopRequested.load(std::memory_order_acquire))
+    {
+        return true;
+    }
+    const uint64_t nextEventCycle = m_nextDeadlineCycle.load(std::memory_order_acquire);
+    if (nextEventCycle != 0u && m_eeCycle >= nextEventCycle)
+    {
+        raiseCheckpoint();
+        return true;
+    }
+    if (m_eeCycle >= m_sliceEndCycle && sliceEnded())
+    {
+        return true;
+    }
+    // Nothing due: the fast path runs up to where something may be.
+    uint64_t ahead = std::min<uint64_t>(m_sliceEndCycle - m_eeCycle, kAccountStrideCycles);
+    if (nextEventCycle != 0u)
+    {
+        ahead = std::min<uint64_t>(ahead, nextEventCycle - m_eeCycle);
+    }
+    ahead = std::min<uint64_t>(ahead, m_runtime.memory().cyclesUntilNextEeTimerInterrupt());
+    m_fastUntil.store(m_eeCycle + std::max<uint64_t>(1u, ahead), std::memory_order_seq_cst);
+    // Another thread that raised a checkpoint or set a deadline meanwhile
+    // cleared m_fastUntil before the store above: clear it again.
+    if (m_checkpointPending.load(std::memory_order_seq_cst) ||
+        m_nextDeadlineCycle.load(std::memory_order_seq_cst) != nextEventCycle)
+    {
+        m_fastUntil.store(0u, std::memory_order_seq_cst);
+    }
+    return false;
 }
 
 bool EeScheduler::sliceEnded() noexcept
@@ -681,7 +718,7 @@ void EeScheduler::creditStall(std::chrono::nanoseconds waited) noexcept
         return;
     }
     m_pendingStallNs.fetch_add(waited.count(), std::memory_order_relaxed);
-    m_checkpointPending.store(true, std::memory_order_release);
+    raiseCheckpoint();
 }
 
 void EeScheduler::applyStallCredit(std::chrono::steady_clock::time_point now)
@@ -1440,7 +1477,7 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
     assertExecutor();
     invocation.sequence = ++m_invocationSequence;
     m_pendingInvocations.push_back(std::move(invocation));
-    m_checkpointPending.store(true, std::memory_order_release);
+    raiseCheckpoint();
 }
 
 [[noreturn]] void EeScheduler::invokeCurrent(GuestInvocation invocation)
@@ -2093,7 +2130,7 @@ void EeScheduler::requestPreemptionIfHigher(const GuestThread &readyThread, bool
     m_rescheduleRequested = true;
     if (interruptSafe || m_insideInterrupt)
     {
-        m_checkpointPending.store(true, std::memory_order_release);
+        raiseCheckpoint();
     }
 }
 
@@ -2183,6 +2220,7 @@ void EeScheduler::processPendingEvents()
                                  m_stopRequested.load(std::memory_order_acquire) ||
                                  m_pauseRequested.load(std::memory_order_acquire);
         m_checkpointPending.store(pendingWork, std::memory_order_release);
+        m_fastUntil.store(0u, std::memory_order_seq_cst);
     }
     applyPendingPreemption();
 }
@@ -2396,7 +2434,7 @@ void EeScheduler::processEvent(const EeEvent &event)
             // stepVBlank: the VBlank's handlers run, then the next checkpoint pauses.
             m_pauseAtTick.store(0u, std::memory_order_relaxed);
             m_pauseRequested.store(true, std::memory_order_release);
-            m_checkpointPending.store(true, std::memory_order_release);
+            raiseCheckpoint();
         }
         m_runtime.gs().vsync(m_vsyncTick);
         if ((m_vsyncTick & 1u) != 0u)
@@ -2590,7 +2628,7 @@ void EeScheduler::waitForEvent()
         if (cycles > 0u)
         {
             catchUpClock(cycles);
-            m_checkpointPending.store(true, std::memory_order_release);
+            raiseCheckpoint();
         }
         return;
     }
@@ -2605,7 +2643,7 @@ void EeScheduler::waitForEvent()
             accountCycles(step);
             remaining -= step;
         }
-        m_checkpointPending.store(true, std::memory_order_release);
+        raiseCheckpoint();
     }
 }
 
@@ -2628,6 +2666,7 @@ void EeScheduler::updateNextDeadline()
     if (m_deadlines.empty())
     {
         m_nextDeadlineCycle.store(0u, std::memory_order_release);
+        m_fastUntil.store(0u, std::memory_order_seq_cst);
         return;
     }
     const auto it = std::min_element(m_deadlines.begin(), m_deadlines.end(),
@@ -2640,6 +2679,7 @@ void EeScheduler::updateNextDeadline()
                                          return left.sequence < right.sequence;
                                      });
     m_nextDeadlineCycle.store(it->deadlineCycle, std::memory_order_release);
+    m_fastUntil.store(0u, std::memory_order_seq_cst);
 }
 
 bool EeScheduler::hasReadyAtOrAbovePriority(int priority) const
@@ -2659,6 +2699,7 @@ void EeScheduler::renewTimeSlice()
 {
     m_sliceEndCycle = m_eeCycle + kDefaultTimeSliceCycles;
     m_timeSliceExpired = false;
+    m_fastUntil.store(0u, std::memory_order_relaxed);
 }
 
 void EeScheduler::copyMainContextToRuntime()
