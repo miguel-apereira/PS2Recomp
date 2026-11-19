@@ -1473,7 +1473,40 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
     }
 }
 
-bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+namespace
+{
+// Debugging aid: TGR_TRACE_CALLS="0x1ED878,0x1EDE48" logs calls to those
+// guest functions (caller and a0-a3), up to 64 times each. Built at start-up:
+// a function-local static would cost a guard check on every guest call.
+struct CallTrace
+{
+    std::unordered_map<uint32_t, int> targets;
+    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    long long afterMs = 0;
+};
+CallTrace *const g_callTrace = []
+{
+    auto *t = new CallTrace();
+    if (const char *list = std::getenv("TGR_TRACE_CALLS"))
+    {
+        for (const char *cursor = list; *cursor;)
+        {
+            char *end = nullptr;
+            const unsigned long value = std::strtoul(cursor, &end, 0);
+            if (end == cursor)
+                break;
+            t->targets[static_cast<uint32_t>(value)] = 0;
+            cursor = (*end == ',') ? end + 1 : end;
+        }
+    }
+    if (const char *after = std::getenv("TGR_TRACE_AFTER_MS"))
+        t->afterMs = std::atoll(after);
+    return t;
+}();
+} // namespace
+
+// Inline into ps2_guest::dispatchGuestBranch, which every guest call goes through.
+__forceinline bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                                      R5900Context *ctx,
                                      uint32_t targetPc,
                                      uint32_t sourcePc,
@@ -1484,34 +1517,8 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     ctx->pc = targetPc;
     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
 
-    // Debugging aid: TGR_TRACE_CALLS="0x1ED878,0x1EDE48" logs calls to those
-    // guest functions (caller and a0-a3), up to 64 times each. One static (one
-    // guard check a call): this runs for every guest call.
-    struct CallTrace
-    {
-        std::unordered_map<uint32_t, int> targets;
-        std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
-        long long afterMs = 0;
-    };
-    static CallTrace *const trace = []
-    {
-        auto *t = new CallTrace();
-        if (const char *list = std::getenv("TGR_TRACE_CALLS"))
-        {
-            for (const char *cursor = list; *cursor;)
-            {
-                char *end = nullptr;
-                const unsigned long value = std::strtoul(cursor, &end, 0);
-                if (end == cursor)
-                    break;
-                t->targets[static_cast<uint32_t>(value)] = 0;
-                cursor = (*end == ',') ? end + 1 : end;
-            }
-        }
-        if (const char *after = std::getenv("TGR_TRACE_AFTER_MS"))
-            t->afterMs = std::atoll(after);
-        return t;
-    }();
+    // Debugging aid: TGR_TRACE_CALLS (see g_callTrace).
+    CallTrace *const trace = g_callTrace;
     if (isCall && !trace->targets.empty() &&
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - trace->start).count() >=
             trace->afterMs)
@@ -2413,11 +2420,6 @@ void PS2Runtime::requestStop()
     {
         m_eeScheduler->requestStop();
     }
-}
-
-bool PS2Runtime::isStopRequested() const
-{
-    return m_stopRequested.load(std::memory_order_relaxed);
 }
 
 EeScheduler &PS2Runtime::eeScheduler()

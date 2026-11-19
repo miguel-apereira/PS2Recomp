@@ -217,7 +217,7 @@ public:
     void drainCompletedDmacHandlers(uint8_t *rdram);
 
     void requestStop();
-    bool isStopRequested() const;
+    bool isStopRequested() const { return m_stopRequested.load(std::memory_order_relaxed); }
 
     EeScheduler &eeScheduler();
     const EeScheduler &eeScheduler() const;
