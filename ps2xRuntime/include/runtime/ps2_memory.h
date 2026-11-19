@@ -99,6 +99,75 @@ struct JumpTable
     std::vector<uint32_t> targets; // Jump targets
 };
 
+// The I/O registers (and the few other addresses written through the same
+// path), as std::unordered_map<uint32_t, uint32_t> was used: operator[] makes
+// an entry, count() and find() say whether one exists. The word-aligned
+// addresses of the 64 KB I/O page live in a flat table, since every DMA, VIF
+// and timer access goes through here; any other address in a map.
+class IoRegisterFile
+{
+public:
+    struct Entry
+    {
+        uint32_t first;  // the address
+        uint32_t second; // the value
+    };
+
+    IoRegisterFile()
+    {
+        for (uint32_t i = 0; i < kWords; ++i)
+            m_flat[i] = {PS2_IO_BASE + i * 4u, 0u};
+    }
+
+    uint32_t &operator[](uint32_t address)
+    {
+        const uint32_t offset = address - PS2_IO_BASE;
+        if (offset < PS2_IO_SIZE && (offset & 3u) == 0u)
+        {
+            m_present[offset >> 2] = 1u;
+            return m_flat[offset >> 2].second;
+        }
+        Entry &e = m_other[address];
+        e.first = address;
+        return e.second;
+    }
+
+    size_t count(uint32_t address) const
+    {
+        const uint32_t offset = address - PS2_IO_BASE;
+        if (offset < PS2_IO_SIZE && (offset & 3u) == 0u)
+            return m_present[offset >> 2];
+        return m_other.count(address);
+    }
+
+    Entry *find(uint32_t address)
+    {
+        const uint32_t offset = address - PS2_IO_BASE;
+        if (offset < PS2_IO_SIZE && (offset & 3u) == 0u)
+            return m_present[offset >> 2] ? &m_flat[offset >> 2] : nullptr;
+        const auto it = m_other.find(address);
+        return it == m_other.end() ? nullptr : &it->second;
+    }
+
+    const Entry *find(uint32_t address) const { return const_cast<IoRegisterFile *>(this)->find(address); }
+    Entry *end() { return nullptr; }
+    const Entry *end() const { return nullptr; }
+
+    void clear()
+    {
+        for (uint32_t i = 0; i < kWords; ++i)
+            m_flat[i].second = 0u;
+        m_present.fill(0u);
+        m_other.clear();
+    }
+
+private:
+    static constexpr uint32_t kWords = PS2_IO_SIZE / 4u;
+    std::array<Entry, kWords> m_flat;
+    std::array<uint8_t, kWords> m_present{};
+    std::unordered_map<uint32_t, Entry> m_other;
+};
+
 class PS2Memory
 {
 public:
@@ -304,7 +373,7 @@ public:
     std::atomic<uint64_t> m_vu0CodeGeneration{0};
     std::atomic<uint64_t> m_vu1CodeGeneration{0};
     // I/O registers
-    std::unordered_map<uint32_t, uint32_t> m_ioRegisters;
+    IoRegisterFile m_ioRegisters;
 
     // Registers
     GSRegisters gs_regs;
