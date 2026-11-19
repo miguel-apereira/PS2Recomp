@@ -657,18 +657,21 @@ ps2x::iop::ModuleLoadResult PS2Runtime::loadIopModule(std::string_view path, con
         return result;
     }
 
+    flushIopCycles();
     auto scope = m_iopHost->enterCall(nullptr, m_memory.getRDRAM());
     return m_iopSubsystem->loadModule(path, arguments, argumentSize);
 }
 
 ps2x::iop::ModuleLoadResult PS2Runtime::loadIopModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize)
 {
+    flushIopCycles();
     auto scope = m_iopHost->enterCall(nullptr, m_memory.getRDRAM());
     return m_iopSubsystem->loadModuleBuffer(guestAddress, arguments, argumentSize);
 }
 
 bool PS2Runtime::stopIopModule(int32_t moduleId, int32_t *result)
 {
+    flushIopCycles();
     auto scope = m_iopHost->enterCall(nullptr, m_memory.getRDRAM());
     return m_iopSubsystem->stopModule(moduleId, result);
 }
@@ -685,6 +688,7 @@ bool PS2Runtime::canBindIopRpc(uint32_t sid) const noexcept
 
 ps2x::iop::RpcResult PS2Runtime::handleIopRpc(uint8_t *rdram, R5900Context *ctx, ps2x::iop::RpcRequest request)
 {
+    flushIopCycles();
     auto scope = m_iopHost->enterCall(ctx, rdram);
     request.callToken = scope.token();
     return m_iopSubsystem->handleRpc(request);
@@ -692,17 +696,28 @@ ps2x::iop::RpcResult PS2Runtime::handleIopRpc(uint8_t *rdram, R5900Context *ctx,
 
 void PS2Runtime::notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransfer &transfer)
 {
+    flushIopCycles();
     auto scope = m_iopHost->enterCall(nullptr, rdram);
     m_iopSubsystem->onSifTransfer(transfer);
 }
 
-void PS2Runtime::advanceIopEeCycles(uint64_t eeCycles) noexcept
+void PS2Runtime::flushIopCycles() noexcept
 {
-    m_iopSubsystem->runEeCycles(eeCycles);
+    static const uint64_t batch = []
+    {
+        const char *value = std::getenv("TGR_IOP_BATCH");
+        return value ? std::max<uint64_t>(1u, std::strtoull(value, nullptr, 0)) : uint64_t{128};
+    }();
+    m_iopBatchEeCycles = batch;
+    const uint64_t cycles = m_iopPendingEeCycles;
+    m_iopPendingEeCycles = 0;
+    if (cycles != 0u)
+        m_iopSubsystem->runEeCycles(cycles);
 }
 
 void PS2Runtime::resetIop()
 {
+    m_iopPendingEeCycles = 0;
     m_iopSubsystem->reset();
 }
 

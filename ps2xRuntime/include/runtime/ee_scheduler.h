@@ -281,8 +281,41 @@ public:
     void run();
     void requestStop();
     void postEvent(EeEvent event);
-    [[nodiscard]] bool checkpointDue(uint32_t cycles = kGeneratedCheckpointCycles) noexcept;
-    void accountCycles(uint32_t cycles) noexcept;
+    // At every guest call and loop edge: inline, so the common case (nothing
+    // due) costs a few loads and compares; the end of a time slice goes out
+    // of line.
+    [[nodiscard]] bool checkpointDue(uint32_t cycles = kGeneratedCheckpointCycles) noexcept
+    {
+        accountCycles(cycles);
+        if (m_checkpointPending.load(std::memory_order_acquire) || m_stopRequested.load(std::memory_order_acquire))
+        {
+            return true;
+        }
+        const uint64_t nextEventCycle = m_nextDeadlineCycle.load(std::memory_order_acquire);
+        if (nextEventCycle != 0u && m_eeCycle >= nextEventCycle)
+        {
+            m_checkpointPending.store(true, std::memory_order_release);
+            return true;
+        }
+        if (m_eeCycle < m_sliceEndCycle)
+        {
+            return false;
+        }
+        return sliceEnded();
+    }
+    void accountCycles(uint32_t cycles) noexcept
+    {
+        const uint64_t elapsed = std::max<uint64_t>(1u, cycles);
+        m_eeCycle += elapsed;
+        m_pendingEeTimerInterrupts |= m_runtime.memory().advanceEeTimers(elapsed);
+        m_runtime.advanceIopEeCycles(elapsed);
+        if (m_pendingEeTimerInterrupts != 0u)
+        {
+            m_checkpointPending.store(true, std::memory_order_release);
+        }
+    }
+    // checkpointDue at the end of a time slice: a reschedule, or a new slice.
+    [[nodiscard]] bool sliceEnded() noexcept;
     // EE overclock, in percent of the PS2's speed (100: none). The fixed
     // charges for guest code (loop iterations, dispatches) are divided by
     // it, so the guest gets that much more work done per frame: a game

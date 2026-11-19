@@ -649,28 +649,8 @@ void EeScheduler::postEvent(EeEvent event)
     m_eventCv.notify_one();
 }
 
-bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
+bool EeScheduler::sliceEnded() noexcept
 {
-    accountCycles(cycles);
-
-    if (m_checkpointPending.load(std::memory_order_acquire) ||
-        m_stopRequested.load(std::memory_order_acquire))
-    {
-        return true;
-    }
-
-    const uint64_t nextEventCycle = m_nextDeadlineCycle.load(std::memory_order_acquire);
-    if (nextEventCycle != 0u && m_eeCycle >= nextEventCycle)
-    {
-        m_checkpointPending.store(true, std::memory_order_release);
-        return true;
-    }
-
-    if (m_eeCycle < m_sliceEndCycle)
-    {
-        return false;
-    }
-
     const GuestThread *running = currentThread();
     if (running != nullptr && hasReadyAtOrAbovePriority(running->currentPriority))
     {
@@ -741,18 +721,6 @@ void EeScheduler::applyStallCredit(std::chrono::steady_clock::time_point now)
     {
         m_stallCyclesCredited.fetch_add(cycles, std::memory_order_relaxed);
         catchUpClock(cycles);
-    }
-}
-
-void EeScheduler::accountCycles(uint32_t cycles) noexcept
-{
-    const uint64_t elapsed = std::max<uint64_t>(1u, cycles);
-    m_eeCycle += elapsed;
-    m_pendingEeTimerInterrupts |= m_runtime.memory().advanceEeTimers(elapsed);
-    m_runtime.advanceIopEeCycles(elapsed);
-    if (m_pendingEeTimerInterrupts != 0u)
-    {
-        m_checkpointPending.store(true, std::memory_order_release);
     }
 }
 
