@@ -1546,9 +1546,17 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     const bool tieEnabled = (chcr & (1u << 7)) != 0u;
                     // A guard against chains that loop forever, far above any real frame.
                     const int kMaxChainTags = 1 << 20;
+                    // A GIF chain goes to the path3 gather hook in place, when there
+                    // is one and the transfer is sent at once (below): no copy here.
+                    const bool gather = channelBase == 0x1000A000u && m_path3GatherHook &&
+                                        (m_gifPacketCallback || m_gifArbiter != nullptr) &&
+                                        m_pendingGifTransfers.empty();
+                    std::vector<GatherPiece> pieces;
+                    uint32_t pieceBytes = 0;
                     std::vector<uint8_t> chainBuf;
                     // Room for a chain like the last one: no reallocation (and copy) while it grows.
-                    chainBuf.reserve(m_chainBytesHint);
+                    if (!gather)
+                        chainBuf.reserve(m_chainBytesHint);
 
                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
                     {
@@ -1579,7 +1587,13 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                                 chunk = maxSz2 - src;
                             if (chunk == 0)
                                 break;
-                            chainBuf.insert(chainBuf.end(), base2 + src, base2 + src + chunk);
+                            if (gather)
+                            {
+                                pieces.push_back({base2 + src, chunk});
+                                pieceBytes += chunk;
+                            }
+                            else
+                                chainBuf.insert(chainBuf.end(), base2 + src, base2 + src + chunk);
                             bytes -= chunk;
                             src += chunk;
                         }
@@ -1731,8 +1745,16 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     chcr = (chcr & 0x0000FFFFu) | (lastTagUpper << 16);
                     m_ioRegisters[channelBase + 0x00] = chcr;
 
-                    m_chainBytesHint = std::max<size_t>(chainBuf.size() + chainBuf.size() / 4u, 4096u);
-                    if (!chainBuf.empty())
+                    if (!gather)
+                        m_chainBytesHint = std::max<size_t>(chainBuf.size() + chainBuf.size() / 4u, 4096u);
+                    if (!pieces.empty())
+                    {
+                        PendingTransfer pt;
+                        pt.pieces = std::move(pieces);
+                        pt.pieceBytes = pieceBytes;
+                        m_pendingGifTransfers.push_back(std::move(pt));
+                    }
+                    else if (!chainBuf.empty())
                     {
                         PendingTransfer pt;
                         pt.fromScratchpad = false;
@@ -1893,9 +1915,9 @@ void PS2Memory::processPendingTransfers()
     uint32_t observedGifQwc = 0u;
     for (const auto &transfer : m_pendingGifTransfers)
     {
-        const uint64_t transferQwc = !transfer.chainData.empty()
-                                         ? (transfer.chainData.size() / 16u)
-                                         : transfer.qwc;
+        const uint64_t transferQwc = !transfer.pieces.empty()      ? (transfer.pieceBytes / 16u)
+                                     : !transfer.chainData.empty() ? (transfer.chainData.size() / 16u)
+                                                                   : transfer.qwc;
         observedGifQwc = static_cast<uint32_t>(std::min<uint64_t>(16u, static_cast<uint64_t>(observedGifQwc) + transferQwc));
     }
     if (observedGifQwc != 0u)
@@ -1910,7 +1932,21 @@ void PS2Memory::processPendingTransfers()
     for (size_t idx = 0; idx < m_pendingGifTransfers.size(); ++idx)
     {
         auto &p = m_pendingGifTransfers[idx];
-        if (!p.chainData.empty())
+        if (!p.pieces.empty())
+        {
+            m_seenGifCopy = true;
+            m_gifCopyCount.fetch_add(1, std::memory_order_relaxed);
+            if (!m_path3GatherHook || !m_path3GatherHook(p.pieces.data(), p.pieces.size(), p.pieceBytes))
+            {
+                // Not taken: as one packet, the way a chain always went.
+                std::vector<uint8_t> data;
+                data.reserve(p.pieceBytes);
+                for (const GatherPiece &piece : p.pieces)
+                    data.insert(data.end(), piece.data, piece.data + piece.bytes);
+                submitGifPacket(GifPathId::Path3, data.data(), static_cast<uint32_t>(data.size()), false);
+            }
+        }
+        else if (!p.chainData.empty())
         {
             m_seenGifCopy = true;
             m_gifCopyCount.fetch_add(1, std::memory_order_relaxed);

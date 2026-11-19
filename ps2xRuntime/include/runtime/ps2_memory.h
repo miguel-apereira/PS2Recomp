@@ -310,6 +310,17 @@ public:
     // drains the GIF after its DMA then (the host drains after each packet).
     using Path3Hook = std::function<bool(const uint8_t *data, uint32_t sizeBytes, bool drainImmediately)>;
     void setPath3Hook(Path3Hook hook) { m_path3Hook = std::move(hook); }
+    // A GIF DMA chain's payloads in guest memory, in order: one PATH3 packet.
+    struct GatherPiece
+    {
+        const uint8_t *data;
+        uint32_t bytes;
+    };
+    // Like the path3 hook, for a source chain on the GIF channel, which then
+    // needs no copy of its own: true when the hook took the packet. Called
+    // at once, while the pieces still hold what the DMA read.
+    using Path3GatherHook = std::function<bool(const GatherPiece *pieces, size_t count, uint32_t sizeBytes)>;
+    void setPath3GatherHook(Path3GatherHook hook) { m_path3GatherHook = std::move(hook); }
 
     using Vu1MscalCallback = std::function<void(uint32_t startPC, uint32_t top, uint32_t itop)>;
     void setVu1MscalCallback(Vu1MscalCallback cb) { m_vu1MscalCallback = std::move(cb); }
@@ -406,6 +417,7 @@ public:
     std::atomic<uint32_t> m_pendingIntc{0};
     GsSyncHook m_gsSyncHook;
     Path3Hook m_path3Hook;
+    Path3GatherHook m_path3GatherHook;
     std::atomic<uint32_t> m_pendingDmac{0};
 
     void serviceIpu();
@@ -430,6 +442,9 @@ public:
         uint32_t srcAddr = 0;
         uint32_t qwc = 0;
         std::vector<uint8_t> chainData;
+        // Or a GIF chain's payloads in place (m_path3GatherHook), pieceBytes in all.
+        std::vector<GatherPiece> pieces;
+        uint32_t pieceBytes = 0;
     };
     std::vector<PendingTransfer> m_pendingGifTransfers;
     std::vector<PendingTransfer> m_pendingVif0Transfers;
