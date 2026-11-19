@@ -316,6 +316,17 @@ public:
     // instead and the game keeps real time. May change while the guest runs.
     void setVBlankCatchUp(bool enabled) noexcept { m_vblankCatchUp.store(enabled, std::memory_order_relaxed); }
     [[nodiscard]] bool vblankCatchUp() const noexcept { return m_vblankCatchUp.load(std::memory_order_relaxed); }
+
+    // Display sync: each VBlank's host time snaps to the display's refresh
+    // grid (anchor: the host time of one display vblank; period: its refresh
+    // period) plus offset, so the VBlanks keep the display's rate and phase:
+    // one per refresh at 60 Hz, one per n refreshes at n times 60 Hz. Used
+    // only at normal speed and when the VBlank period is within 1% of a whole
+    // number of refreshes; period 0 turns it off. May change while the guest runs.
+    void setDisplaySync(std::chrono::steady_clock::time_point anchor, std::chrono::nanoseconds period,
+                        std::chrono::nanoseconds offset) noexcept;
+    // Whether the last VBlank was snapped to the display.
+    [[nodiscard]] bool displaySynced() const noexcept { return m_displaySynced.load(std::memory_order_relaxed); }
     // With VBlank catch-up, the EE clock (EE timers, COP0 Count, the IOP)
     // keeps real time too: host time the EE spends idle counts as EE cycles
     // even when an event wakes it before its next deadline, and a VBlank that
@@ -556,6 +567,12 @@ private:
     std::atomic<uint64_t> m_nextDeadlineCycle{0};
 
     std::atomic<bool> m_vblankCatchUp{false};
+    std::atomic<int64_t> m_displayAnchorNs{0}; // steady_clock, since its epoch
+    std::atomic<int64_t> m_displayPeriodNs{0};
+    std::atomic<int64_t> m_displayOffsetNs{0};
+    std::atomic<bool> m_displaySynced{false};
+    std::chrono::steady_clock::time_point alignToDisplay(std::chrono::steady_clock::time_point next,
+                                                         std::chrono::nanoseconds period) noexcept;
     std::atomic<bool> m_clockCatchUp{true};
     std::atomic<uint32_t> m_guestCycleScale{256u}; // setOverclock: 256 = PS2 speed
     std::atomic<float> m_speed{1.0f};

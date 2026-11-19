@@ -8,6 +8,7 @@
 #include <iostream>
 #include <unordered_map>
 #include <cassert>
+#include <cmath>
 #include <cstring>
 #include <limits>
 #include <bit>
@@ -201,6 +202,43 @@ void EeScheduler::runPacer()
             m_checkpointPending.store(true, std::memory_order_release);
         }
     }
+}
+
+void EeScheduler::setDisplaySync(std::chrono::steady_clock::time_point anchor, std::chrono::nanoseconds period,
+                                 std::chrono::nanoseconds offset) noexcept
+{
+    m_displayAnchorNs.store(std::chrono::duration_cast<std::chrono::nanoseconds>(anchor.time_since_epoch()).count(),
+                            std::memory_order_relaxed);
+    m_displayOffsetNs.store(offset.count(), std::memory_order_relaxed);
+    m_displayPeriodNs.store(period.count(), std::memory_order_release);
+}
+
+std::chrono::steady_clock::time_point EeScheduler::alignToDisplay(std::chrono::steady_clock::time_point next,
+                                                                  std::chrono::nanoseconds period) noexcept
+{
+    const int64_t refresh = m_displayPeriodNs.load(std::memory_order_acquire);
+    if (refresh <= 0)
+    {
+        m_displaySynced.store(false, std::memory_order_relaxed);
+        return next;
+    }
+    // A whole number of refreshes per VBlank (60, 120, 180 Hz...), within 1%.
+    const double ratio = static_cast<double>(period.count()) / static_cast<double>(refresh);
+    const double whole = std::round(ratio);
+    if (whole < 1.0 || std::abs(ratio - whole) > 0.01 * whole)
+    {
+        m_displaySynced.store(false, std::memory_order_relaxed);
+        return next;
+    }
+    // The refresh (plus offset) nearest to the VBlank's own time: the VBlanks
+    // follow the display's clock, and a phase error is gone after one VBlank.
+    const int64_t anchor = m_displayAnchorNs.load(std::memory_order_relaxed) + m_displayOffsetNs.load(std::memory_order_relaxed);
+    const int64_t at = std::chrono::duration_cast<std::chrono::nanoseconds>(next.time_since_epoch()).count();
+    const double steps = std::round(static_cast<double>(at - anchor) / static_cast<double>(refresh));
+    const int64_t aligned = anchor + static_cast<int64_t>(steps) * refresh;
+    m_displaySynced.store(true, std::memory_order_relaxed);
+    return std::chrono::steady_clock::time_point(
+        std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::nanoseconds(aligned)));
 }
 
 void EeScheduler::stopPacer()
@@ -2360,8 +2398,13 @@ void EeScheduler::processDueDeadlines()
                 scheduleEvent(vblankCycle + kVBlankDurationCycles,
                               hostDeadline + duration,
                               EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
+                auto nextHostDeadline = hostDeadline + period;
+                if (speed == 1.0f)
+                {
+                    nextHostDeadline = alignToDisplay(nextHostDeadline, period);
+                }
                 scheduleEvent(vblankCycle + kVBlankPeriodCycles,
-                              hostDeadline + period,
+                              nextHostDeadline,
                               EeEvent{EeEventType::VBlankStart, 0, 0});
             }
             processEvent(scheduled.event);
