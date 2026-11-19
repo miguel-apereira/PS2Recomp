@@ -115,7 +115,7 @@ namespace
     // function) or a checkpoint at a loop edge. A call whose callee comes back
     // with the PC still at the callee's entry finished only if this did not
     // change meanwhile (see dispatchGuestBranch).
-    thread_local uint64_t g_guestUnwinds = 0u;
+    using ps2_guest::g_guestUnwinds; // see ps2_guest_abi.h
 
     bool computeFileCrc32(const std::string &path, uint32_t &crcOut)
     {
@@ -505,6 +505,17 @@ PS2Runtime::PS2Runtime()
     m_iopSubsystem = std::make_unique<ps2x::iop::IopSubsystem>(*m_iopHost);
 
     m_eeScheduler = std::make_unique<EeScheduler>(*this);
+    // The inline path of direct calls (ps2_guest::dispatchGuestBranch).
+    {
+        ps2_guest::FastDispatch &fast = ps2_guest::g_fastDispatch;
+        fast.table = reinterpret_cast<ps2_guest::GuestFunction *>(g_ps2RecompiledFunctionTable);
+        fast.base = g_ps2RecompiledFunctionTableBase;
+        fast.slots = g_ps2RecompiledFunctionTableSlotCount;
+        fast.stopRequested = &m_stopRequested;
+        m_eeScheduler->exportFastDispatch(fast);
+        fast.enabled = !std::getenv("TGR_TRACE_CALLS") && !std::getenv("TGR_NO_FAST_CALLS") &&
+                       g_ps2RecompiledFunctionTableSlotCount != 0u;
+    }
 
     // Assign rather than memset: R5900Context's constructor zeroes itself and
     // then applies the COP0 reset values, which a memset here would discard.
@@ -2775,14 +2786,16 @@ namespace ps2_guest
         runtime->Store128(rdram, ctx, vaddr, value);
     }
 
-    bool dispatchGuestBranch(PS2Runtime *runtime,
-                             uint8_t *rdram,
-                             R5900Context *ctx,
-                             uint32_t targetPc,
-                             uint32_t sourcePc,
-                             uint32_t fallthroughPc,
-                             Ps2GuestBranchKind kind,
-                             const char *debugName)
+    FastDispatch g_fastDispatch;
+
+    bool dispatchGuestBranchSlow(PS2Runtime *runtime,
+                                 uint8_t *rdram,
+                                 R5900Context *ctx,
+                                 uint32_t targetPc,
+                                 uint32_t sourcePc,
+                                 uint32_t fallthroughPc,
+                                 Ps2GuestBranchKind kind,
+                                 const char *debugName)
     {
         return runtime->dispatchGuestBranch(rdram, ctx, targetPc, sourcePc, fallthroughPc, kind, debugName);
     }

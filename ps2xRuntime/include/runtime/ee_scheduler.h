@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ps2_runtime.h"
+#include "ps2_guest_abi.h"
 
 #include <algorithm>
 #include <array>
@@ -341,6 +342,14 @@ public:
     {
         percent = std::clamp(percent, 25u, 800u);
         m_guestCycleScale.store((256u * 100u + percent / 2u) / percent, std::memory_order_relaxed);
+        ps2_guest::g_fastDispatch.callCycles.store(guestCycles(kGuestDispatchCycles), std::memory_order_relaxed);
+    }
+    // The clock and checkpoint limit for the inline path of direct calls.
+    void exportFastDispatch(ps2_guest::FastDispatch &fast) noexcept
+    {
+        fast.eeCycle = &m_eeCycle;
+        fast.fastUntil = &m_fastUntil;
+        fast.callCycles.store(guestCycles(kGuestDispatchCycles), std::memory_order_relaxed);
     }
     [[nodiscard]] uint32_t overclock() const noexcept
     {
