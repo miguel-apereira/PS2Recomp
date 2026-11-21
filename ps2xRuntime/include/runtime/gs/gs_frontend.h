@@ -4,11 +4,14 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <vector>
 
 #include "runtime/gs/gs_backend.h"
+
+class PS2GsHost;
 
 struct GSDebugSnapshot
 {
@@ -106,6 +109,14 @@ public:
     void reset();
     void setRasterBackend(std::unique_ptr<GSRasterBackend> backend);
 
+    // Installs a host that sees everything reaching the GS first and may take
+    // it over (see PS2GsHost). nullptr removes it.
+    void setHost(PS2GsHost *host) { m_host = host; }
+    PS2GsHost *host() const { return m_host; }
+
+    // Called by the EE scheduler at the start of each vertical blank.
+    void vsync(uint64_t tick);
+
     void processGIFPacket(const uint8_t *data, uint32_t sizeBytes);
     bool processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes);
     void uploadImageNative(uint64_t bitbltbuf,
@@ -142,6 +153,12 @@ public:
     uint64_t nativePackedGIFPacketCount() const { return m_nativePackedGIFPacketCount; }
 
     uint32_t consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes);
+
+    // A SIGNAL that arrives while CSR.SIGNAL is still set waits, as the GS
+    // stalls on it, until the CPU clears the bit. Then this applies it (sets
+    // SIGLBLID and CSR.SIGNAL again) and returns true, so every SIGNAL raises
+    // its own interrupt. Called by the EE scheduler when it checks GS events.
+    bool releaseDeferredSignal();
 
     void refreshDisplaySnapshot();
 
@@ -181,6 +198,8 @@ private:
     uint32_t m_localMemorySize = 0u;
     struct GSRegisters *m_privRegs = nullptr;
     mutable std::recursive_mutex m_stateMutex;
+    std::deque<uint64_t> m_deferredSignals; // SIGNAL values waiting for CSR.SIGNAL to clear
+    uint64_t m_deferredSignalCount = 0u;
     mutable std::mutex m_backendLifetimeMutex;
     mutable std::mutex m_presentationMutex;
 
@@ -242,6 +261,7 @@ private:
     bool m_debugHistoryPaused = true;
 
     std::unique_ptr<GSRasterBackend> m_backend;
+    PS2GsHost *m_host = nullptr;
 };
 
 #endif

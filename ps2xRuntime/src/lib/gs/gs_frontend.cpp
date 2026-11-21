@@ -1,5 +1,6 @@
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/gs_cpu_backend.h"
+#include "runtime/gs/ps2_gs_host.h"
 #include "ps2_log.h"
 #include "runtime/ps2_memory.h"
 #include <atomic>
@@ -154,6 +155,7 @@ void GS::reset()
     m_trxpos = {};
     m_trxreg = {};
     m_trxdir = 3;
+    m_deferredSignals.clear();
     m_vtxCount = 0;
     m_vtxIndex = 0;
     m_preferredDisplaySourceFrame = {};
@@ -643,6 +645,8 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     if (!data || sizeBytes < 16 || !m_backend)
         return;
+    if (m_host && m_host->gifPacket(data, sizeBytes))
+        return;
 
     if (tryProcessNativeImageUploadPacket(data, sizeBytes))
         return;
@@ -744,6 +748,8 @@ bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 
     if (!validatePackedGifPacket(data, sizeBytes))
         return false;
+    if (m_host && m_host->gifPacket(data, sizeBytes))
+        return true;
 
     const bool processed = visitPackedGifPacket(data, sizeBytes, [&](const PackedGifPacketTag &tag)
                                                 {
@@ -784,6 +790,8 @@ void GS::uploadImageNative(uint64_t bitbltbuf,
                            uint32_t sizeBytes)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    if (m_host && data && sizeBytes != 0 && m_host->imageUpload(bitbltbuf, trxpos, trxreg, trxdir, data, sizeBytes))
+        return;
     uploadImageNativeUnlocked(bitbltbuf, trxpos, trxreg, trxdir, data, sizeBytes);
 }
 
@@ -1062,6 +1070,8 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
 void GS::writeRegister(uint8_t regAddr, uint64_t value)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    if (m_host && m_host->registerWrite(regAddr, value))
+        return;
     writeRegisterUnlocked(regAddr, value);
 }
 
@@ -1465,6 +1475,20 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
     {
         if (m_privRegs)
         {
+            // The GS stalls on a second SIGNAL until the CPU clears the first,
+            // so each one reaches the CPU as its own event. Folding them into
+            // one CSR bit would lose interrupts that games count (a semaphore
+            // per SIGNAL, say).
+            if ((m_privRegs->csr.load(std::memory_order_acquire) & 0x1u) != 0u)
+            {
+                if (m_deferredSignals.size() >= 256u) // never cleared: keep the newest
+                    m_deferredSignals.pop_front();
+                m_deferredSignals.push_back(value);
+                if (++m_deferredSignalCount <= 4u)
+                    std::cout << "[gs] SIGNAL while CSR.SIGNAL is set: held until it is cleared ("
+                              << m_deferredSignalCount << ")" << std::endl;
+                break;
+            }
             uint32_t id = static_cast<uint32_t>(value & 0xFFFFFFFF);
             uint32_t mask = static_cast<uint32_t>(value >> 32);
             uint32_t lo = static_cast<uint32_t>(m_privRegs->siglblid & 0xFFFFFFFF);
@@ -1574,9 +1598,13 @@ void GS::vertexKick(bool drawing)
 
     if (drawing && m_backend)
     {
-        GSPrimitiveBatch batch = buildDrawBatch(needed);
-        updatePreferredDisplaySourceForDraw(batch);
-        m_backend->Submit(batch);
+        // A backend that doesn't draw (another renderer does) needs no batch.
+        if (m_backend->Draws())
+        {
+            GSPrimitiveBatch batch = buildDrawBatch(needed);
+            updatePreferredDisplaySourceForDraw(batch);
+            m_backend->Submit(batch);
+        }
         recordDrawDebugEventUnlocked(needed);
     }
 
@@ -1617,19 +1645,44 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
 bool GS::clearFramebufferContext(uint32_t contextIndex, uint32_t rgba)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    if (m_host && m_host->clearFrame((contextIndex != 0u) ? 1u : 0u, rgba))
+        return true;
     return m_backend && m_backend->ClearFramebuffer(m_ctx[(contextIndex != 0u) ? 1 : 0], rgba);
 }
 
 bool GS::clearActiveFramebuffer(uint32_t rgba)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    if (m_host && m_host->clearFrame(m_prim.ctxt ? 1u : 0u, rgba))
+        return true;
     return m_backend && m_backend->ClearFramebuffer(activeContext(), rgba);
+}
+
+bool GS::releaseDeferredSignal()
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    if (m_deferredSignals.empty() || !m_privRegs ||
+        (m_privRegs->csr.load(std::memory_order_acquire) & 0x1u) != 0u)
+        return false;
+    const uint64_t value = m_deferredSignals.front();
+    m_deferredSignals.pop_front();
+    writeRegisterUnlocked(GS_REG_SIGNAL, value);
+    return true;
 }
 
 uint32_t GS::consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    uint32_t bytesRead = 0u;
+    if (m_host && m_host->localToHost(dst, maxBytes, bytesRead))
+        return bytesRead;
     return m_backend ? m_backend->ConsumeLocalToHostBytes(dst, maxBytes) : 0u;
+}
+
+void GS::vsync(uint64_t tick)
+{
+    if (m_host)
+        m_host->vsync(tick);
 }
 
 void GS::setRasterBackend(std::unique_ptr<GSRasterBackend> backend)

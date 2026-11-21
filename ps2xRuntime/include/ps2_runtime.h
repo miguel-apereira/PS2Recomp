@@ -217,7 +217,7 @@ public:
     void drainCompletedDmacHandlers(uint8_t *rdram);
 
     void requestStop();
-    bool isStopRequested() const;
+    bool isStopRequested() const { return m_stopRequested.load(std::memory_order_relaxed); }
 
     EeScheduler &eeScheduler();
     const EeScheduler &eeScheduler() const;
@@ -310,7 +310,17 @@ private:
     [[nodiscard]] bool canBindIopRpc(uint32_t sid) const noexcept;
     [[nodiscard]] ps2x::iop::RpcResult handleIopRpc(uint8_t *rdram, R5900Context *ctx, ps2x::iop::RpcRequest request);
     void notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransfer &transfer);
-    void advanceIopEeCycles(uint64_t eeCycles) noexcept;
+    // The scheduler charges EE cycles at every guest checkpoint, a few at a
+    // time; the IOP gets them in batches (it runs in batches of 16 IOP cycles,
+    // 128 EE cycles, anyway), and whatever is pending before the EE calls into
+    // it (RPC, SIF, modules). TGR_IOP_BATCH sets the batch in EE cycles.
+    void advanceIopEeCycles(uint64_t eeCycles) noexcept
+    {
+        m_iopPendingEeCycles += eeCycles;
+        if (m_iopPendingEeCycles >= m_iopBatchEeCycles)
+            flushIopCycles();
+    }
+    void flushIopCycles() noexcept;
     void resetIop();
 
     friend class PS2IopTransport;
@@ -322,6 +332,8 @@ private:
     GS m_gs;
     std::unique_ptr<PS2IopHostAdapter> m_iopHost;
     std::unique_ptr<ps2x::iop::IopSubsystem> m_iopSubsystem;
+    uint64_t m_iopPendingEeCycles = 0;
+    uint64_t m_iopBatchEeCycles = 128;
     PS2AudioBackend m_audioBackend;
     PSPadBackend m_padBackend;
     PS2RomDevice m_romDevice;

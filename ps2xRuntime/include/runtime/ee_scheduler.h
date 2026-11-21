@@ -1,7 +1,9 @@
 #pragma once
 
 #include "ps2_runtime.h"
+#include "ps2_guest_abi.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -260,6 +262,8 @@ class EeScheduler
 {
 public:
     static constexpr int kMainThreadId = 1;
+    // Unwinds to the dispatcher (C++ exceptions) since the last call.
+    static uint64_t takeTransfers() noexcept;
     static constexpr int kFirstThreadId = 2;
     static constexpr int kLastThreadId = 255;
     static constexpr int kPriorityCount = 128;
@@ -278,9 +282,151 @@ public:
     void run();
     void requestStop();
     void postEvent(EeEvent event);
-    [[nodiscard]] bool checkpointDue(uint32_t cycles = kGeneratedCheckpointCycles) noexcept;
-    void accountCycles(uint32_t cycles) noexcept;
+    // At every guest call and loop edge. The common case is one add and one
+    // compare: m_fastUntil is the EE cycle up to which nothing can be due (the
+    // next deadline, the end of the time slice, the next EE timer interrupt,
+    // at most kAccountStrideCycles on); anything that may make a checkpoint
+    // due sooner (raiseCheckpoint, a new deadline, a new slice) clears it.
+    // The EE timers and the IOP get their cycles in the slow path.
+    [[nodiscard]] bool checkpointDue(uint32_t cycles = kGeneratedCheckpointCycles) noexcept
+    {
+        m_eeCycle += std::max<uint32_t>(1u, cycles);
+        if (m_eeCycle < m_fastUntil.load(std::memory_order_relaxed)) [[likely]]
+        {
+            return false;
+        }
+        return checkpointSlow();
+    }
+    // Charges cycles and hands them to the EE timers and the IOP now.
+    void accountCycles(uint32_t cycles) noexcept
+    {
+        m_eeCycle += std::max<uint32_t>(1u, cycles);
+        flushAccounting();
+    }
+    // The EE cycles charged since the last call go to the EE timers and the IOP.
+    void flushAccounting() noexcept
+    {
+        const uint64_t pending = m_eeCycle - m_accountedCycle;
+        if (pending == 0u)
+        {
+            return;
+        }
+        m_accountedCycle = m_eeCycle;
+        m_pendingEeTimerInterrupts |= m_runtime.memory().advanceEeTimers(pending);
+        m_runtime.advanceIopEeCycles(pending);
+        if (m_pendingEeTimerInterrupts != 0u)
+        {
+            raiseCheckpoint();
+        }
+    }
+    // A checkpoint is due at the next guest checkpoint (any thread).
+    void raiseCheckpoint() noexcept
+    {
+        m_checkpointPending.store(true, std::memory_order_seq_cst);
+        m_fastUntil.store(0u, std::memory_order_seq_cst);
+    }
+    // EE cycles the timers and the IOP may lag behind before the slow path runs.
+    static constexpr uint64_t kAccountStrideCycles = 256u;
+    // checkpointDue past m_fastUntil: accounting, then the full check.
+    [[nodiscard]] bool checkpointSlow() noexcept;
+    // checkpointDue at the end of a time slice: a reschedule, or a new slice.
+    [[nodiscard]] bool sliceEnded() noexcept;
+    // EE overclock, in percent of the PS2's speed (100: none). The fixed
+    // charges for guest code (loop iterations, dispatches) are divided by
+    // it, so the guest gets that much more work done per frame: a game
+    // that slows down on a PS2 when its frame takes too long no longer
+    // does, as long as the host keeps up. The clock itself still runs at
+    // the PS2's rate (VBlanks, timers and the IOP keep real time). May
+    // change while the guest runs.
+    void setOverclock(uint32_t percent) noexcept
+    {
+        percent = std::clamp(percent, 25u, 800u);
+        m_guestCycleScale.store((256u * 100u + percent / 2u) / percent, std::memory_order_relaxed);
+        ps2_guest::g_fastDispatch.callCycles.store(guestCycles(kGuestDispatchCycles), std::memory_order_relaxed);
+    }
+    // The clock and checkpoint limit for the inline path of direct calls.
+    void exportFastDispatch(ps2_guest::FastDispatch &fast) noexcept
+    {
+        fast.eeCycle = &m_eeCycle;
+        fast.fastUntil = &m_fastUntil;
+        fast.callCycles.store(guestCycles(kGuestDispatchCycles), std::memory_order_relaxed);
+    }
+    [[nodiscard]] uint32_t overclock() const noexcept
+    {
+        return (256u * 100u) / std::max(1u, m_guestCycleScale.load(std::memory_order_relaxed));
+    }
+    // The cycles to charge guest code that ran `cycles` PS2 cycles' worth (setOverclock).
+    [[nodiscard]] uint32_t guestCycles(uint32_t cycles) const noexcept
+    {
+        return std::max(1u, (cycles * m_guestCycleScale.load(std::memory_order_relaxed)) >> 8);
+    }
     [[nodiscard]] bool isExecutingGuest() const noexcept;
+    // EE cycles accounted so far (COP0 Count runs from these).
+    [[nodiscard]] uint64_t eeCycle() const noexcept { return m_eeCycle; }
+
+    // VBlank catch-up. Off: a VBlank waits for both its host time and its
+    // EE cycles, so an EE that runs slower than the PS2 runs the game in
+    // slow motion. On: once a VBlank's host time has passed it fires without
+    // waiting for the rest of its EE cycles (after at least an eighth of a
+    // frame of EE time since the last one), so a slow host drops frames
+    // instead and the game keeps real time. May change while the guest runs.
+    void setVBlankCatchUp(bool enabled) noexcept { m_vblankCatchUp.store(enabled, std::memory_order_relaxed); }
+    [[nodiscard]] bool vblankCatchUp() const noexcept { return m_vblankCatchUp.load(std::memory_order_relaxed); }
+
+    // Display sync: each VBlank's host time snaps to the display's refresh
+    // grid (anchor: the host time of one display vblank; period: its refresh
+    // period) plus offset, so the VBlanks keep the display's rate and phase:
+    // one per refresh at 60 Hz, one per n refreshes at n times 60 Hz. Used
+    // only at normal speed and when the VBlank period is within 1% of a whole
+    // number of refreshes; period 0 turns it off. May change while the guest runs.
+    void setDisplaySync(std::chrono::steady_clock::time_point anchor, std::chrono::nanoseconds period,
+                        std::chrono::nanoseconds offset) noexcept;
+    // Whether the last VBlank was snapped to the display.
+    [[nodiscard]] bool displaySynced() const noexcept { return m_displaySynced.load(std::memory_order_relaxed); }
+    // With VBlank catch-up, the EE clock (EE timers, COP0 Count, the IOP)
+    // keeps real time too: host time the EE spends idle counts as EE cycles
+    // even when an event wakes it before its next deadline, and a VBlank that
+    // came early moves the clock on to the cycle it was due at. Off: the EE
+    // clock only counts the cycles the EE ran, so while the EE waits for host
+    // work (or idles between events) everything timed by it falls behind the
+    // VBlanks. On by default. May change while the guest runs.
+    void setClockCatchUp(bool enabled) noexcept { m_clockCatchUp.store(enabled, std::memory_order_relaxed); }
+    [[nodiscard]] bool clockCatchUp() const noexcept { return m_clockCatchUp.load(std::memory_order_relaxed); }
+    // Host time the EE spent stopped inside one of its own memory accesses,
+    // waiting for host work on another thread (a GS register write that waits
+    // for VU1 to finish the frame before it, for one). No checkpoint can run
+    // there, so with clock catch-up the next one counts that time as EE
+    // cycles, as the PS2's clock runs on while its EE stalls. It never takes
+    // the clock past real time (the host time of the next VBlank). Safe from
+    // a memory access; only the EE's own thread's stalls count.
+    void creditStall(std::chrono::nanoseconds waited) noexcept;
+    [[nodiscard]] bool onExecutorThread() const noexcept { return m_executorThread == std::this_thread::get_id(); }
+
+    // Live controls for a host's developer tools, safe from any thread.
+    // Pause: the EE stops at its next checkpoint, so the guest's threads,
+    // VBlanks and timers all wait. On resume, host deadlines move on by the
+    // time spent paused, so the game carries on where it stopped instead of
+    // catching up.
+    void setPaused(bool paused);
+    // True while the EE is held by setPaused (not just asked to stop).
+    [[nodiscard]] bool paused() const noexcept { return m_pausedNow.load(std::memory_order_acquire); }
+    // Resumes until the next VBlank starts, then pauses again.
+    void stepVBlank();
+    // Game speed: VBlank host time runs at this multiple of real time (0.5 is
+    // half speed, 2 is double when the host keeps up). 0: unlimited, VBlanks
+    // follow EE cycles only (catch-up does not apply).
+    void setSpeed(float speed) noexcept { m_speed.store(speed < 0.0f ? 0.0f : speed, std::memory_order_relaxed); }
+    [[nodiscard]] float speed() const noexcept { return m_speed.load(std::memory_order_relaxed); }
+    struct VBlankCatchUpStats
+    {
+        uint64_t caughtUp = 0;  // VBlanks fired before the EE reached their cycles
+        uint64_t skippedCycles = 0; // EE cycles they came early by
+        uint64_t clockCycles = 0;   // EE cycles the clock moved on by (setClockCatchUp)
+        uint64_t stallCycles = 0;   // of those, for the EE's stalls (creditStall)
+        uint64_t dropped = 0;   // VBlanks dropped because the host fell too far behind
+    };
+    // Counts since the last call.
+    [[nodiscard]] VBlankCatchUpStats takeVBlankCatchUpStats() noexcept;
 
     // Kernel object API. All calls except postEvent/requestStop execute on the
     // EE executor and therefore need no host synchronization.
@@ -353,6 +499,10 @@ public:
     [[nodiscard]] const GuestThread *currentThread() const;
     [[nodiscard]] int currentThreadId() const noexcept;
     [[nodiscard]] R5900Context *currentContext();
+    // The context that holds VU0's registers now: the one running guest code,
+    // or between guest runs the scheduler's own copy. VU0 is one unit on the
+    // PS2, so host code that runs VU0 (VIF0's MSCAL) should use this one.
+    [[nodiscard]] R5900Context &vu0Context();
     [[nodiscard]] uint8_t *rdram() const noexcept;
 
     // Direct syscall tests use the same main-thread record without starting a
@@ -369,9 +519,16 @@ private:
         std::chrono::steady_clock::time_point hostDeadline{};
         EeEvent event{};
         uint64_t sequence = 0;
+        bool early = false; // brought forward by VBlank catch-up
+        uint64_t dueCycle = 0; // early: the cycle it was due at before that
     };
 
     void assertExecutor() const;
+    // Moves the EE clock on by `cycles` the EE did not run (setClockCatchUp).
+    void catchUpClock(uint64_t cycles);
+    // Counts the stalls creditStall noted as EE cycles, up to real time.
+    // Called with m_eventMutex held.
+    void applyStallCredit(std::chrono::steady_clock::time_point now);
     [[nodiscard]] int allocateThreadId();
     GuestThread &acquireInvocationThread();
     void enqueueReady(GuestThread &thread, bool front = false);
@@ -392,6 +549,9 @@ private:
     static int waitObjectId(const EeWaitState &wait);
     void writeGuestU32(uint32_t address, uint32_t value);
     void waitForEvent();
+    void waitWhilePaused();
+    void runPacer();
+    void stopPacer();
     void scheduleEvent(uint64_t deadlineCycle, std::chrono::steady_clock::time_point hostDeadline, EeEvent event);
     void updateNextDeadline();
     [[nodiscard]] bool hasReadyAtOrAbovePriority(int priority) const;
@@ -399,6 +559,8 @@ private:
     void copyMainContextToRuntime();
     void publishDebugContext(const R5900Context &context);
     void publishIdleDebugContext();
+    void loadVu0(R5900Context &context);
+    void saveVu0();
 
     PS2Runtime &m_runtime;
     uint8_t *m_rdram = nullptr;
@@ -435,7 +597,18 @@ private:
     std::atomic<bool> m_guestExecuting{false};
     std::atomic<bool> m_stopRequested{false};
     std::atomic<bool> m_checkpointPending{false};
+    // See checkpointDue. Its own cache line: other threads clear it, the EE
+    // reads it at every checkpoint.
+    alignas(64) std::atomic<uint64_t> m_fastUntil{0};
+    uint64_t m_accountedCycle = 0; // EE cycles the timers and the IOP have had
     uint32_t m_debugPublishCountdown = 0u;
+    // VU0's registers and COP2 control registers belong to the chip, not to
+    // a thread: the EE kernel does not switch them, interrupt handlers see
+    // what the interrupted code left, and VIF0 runs microprograms on them.
+    // They are kept here between guest runs and loaded into the context that
+    // runs next (m_vu0Context while it runs).
+    R5900Context m_vu0Home{};
+    R5900Context *m_vu0Context = nullptr;
 
     mutable std::mutex m_eventMutex;
     std::condition_variable m_eventCv;
@@ -452,6 +625,34 @@ private:
     uint32_t m_gsVSyncCallbackSp = 0;
     std::unordered_map<uint64_t, uint32_t> m_invocationStackTops;
     std::atomic<uint64_t> m_nextDeadlineCycle{0};
+
+    std::atomic<bool> m_vblankCatchUp{false};
+    std::atomic<int64_t> m_displayAnchorNs{0}; // steady_clock, since its epoch
+    std::atomic<int64_t> m_displayPeriodNs{0};
+    std::atomic<int64_t> m_displayOffsetNs{0};
+    std::atomic<bool> m_displaySynced{false};
+    std::chrono::steady_clock::time_point alignToDisplay(std::chrono::steady_clock::time_point next,
+                                                         std::chrono::nanoseconds period) noexcept;
+    std::atomic<bool> m_clockCatchUp{true};
+    std::atomic<uint32_t> m_guestCycleScale{256u}; // setOverclock: 256 = PS2 speed
+    std::atomic<float> m_speed{1.0f};
+    std::atomic<bool> m_pauseRequested{false};
+    std::atomic<bool> m_pausedNow{false};
+    std::atomic<uint64_t> m_pauseAtTick{0}; // stepVBlank: pause once this VBlank starts
+    uint64_t m_lastVBlankStartCycle = 0;
+    // Wakes the EE at a VBlank's host time while guest code runs, since
+    // checkpoints otherwise look at EE cycles only.
+    std::thread m_pacer;
+    std::condition_variable m_pacerCv;
+    bool m_pacerStop = false;
+    uint64_t m_deadlineGeneration = 0;
+    std::atomic<bool> m_hostDeadlineDue{false};
+    std::atomic<uint64_t> m_vblanksCaughtUp{0};
+    std::atomic<uint64_t> m_cyclesSkipped{0};
+    std::atomic<uint64_t> m_clockCyclesCaughtUp{0};
+    std::atomic<int64_t> m_pendingStallNs{0};
+    std::atomic<uint64_t> m_stallCyclesCredited{0};
+    std::atomic<uint64_t> m_vblanksDropped{0};
 
     mutable std::mutex m_snapshotMutex;
     EeKernelSnapshot m_snapshot;

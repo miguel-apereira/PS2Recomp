@@ -7,12 +7,15 @@ namespace ps2_stubs
     {
         constexpr uint8_t kPadModeDigital = 0x41;
         constexpr uint8_t kPadModeDualShock = 0x73;
+        constexpr uint8_t kPadModeDualShock2 = 0x79; // analog with pressure bytes
         constexpr uint8_t kPadAnalogCenter = 0x80;
         constexpr int32_t kPadTypeDigital = 4;
         constexpr int32_t kPadTypeDualShock = 7;
         constexpr int32_t kPadStateDisconnected = 0;
         constexpr int32_t kPadStateExecCmd = 5;
         constexpr int32_t kPadStateStable = 6;
+        constexpr int32_t kPadReqStateComplete = 0;
+        constexpr int32_t kPadReqStateBusy = 2;
         constexpr size_t kPadPortCount = 2;
         constexpr size_t kPadSlotCount = 1;
 
@@ -53,7 +56,7 @@ namespace ps2_stubs
             uint16_t buttonMask = 0xFFFFu;
             uint32_t dmaAddr = 0u;
             uint32_t reqState = 0u;
-            uint32_t transientState = 0u;
+            bool commandBusy = false; // a mode/press/button command is still "executing"
             PadInputState lastInput{};
             uint8_t lastData[32]{};
             uint32_t readCount = 0u;
@@ -221,17 +224,26 @@ namespace ps2_stubs
             portState.buttonMask = 0xFFFFu;
             portState.dmaAddr = dmaAddr;
             portState.reqState = 0u;
-            portState.transientState = 0u;
+            portState.commandBusy = false;
         }
 
+        // A real pad takes a few frames to run a command. During that time
+        // scePadGetState reports EXECCMD and scePadGetReqState reports BUSY,
+        // so games that check the request first never see EXECCMD. We run
+        // the command at once and report it busy for one poll of either call.
         void queueExecCmdStateLocked(PadPortState &portState)
         {
-            portState.transientState = static_cast<uint32_t>(kPadStateExecCmd);
+            portState.commandBusy = true;
+        }
+
+        bool pressureModeActive(const PadPortState &portState)
+        {
+            return portState.analogMode && portState.pressureEnabled;
         }
 
         uint8_t pressureValue(const PadInputState &state, const PadPortState &portState, uint16_t mask)
         {
-            if (!portState.pressureEnabled)
+            if (!pressureModeActive(portState))
             {
                 return 0u;
             }
@@ -245,7 +257,9 @@ namespace ps2_stubs
         void fillPadStatus(uint8_t *data, const PadInputState &state, const PadPortState &portState)
         {
             std::memset(data, 0, 32);
-            data[1] = portState.analogMode ? kPadModeDualShock : kPadModeDigital;
+            data[1] = pressureModeActive(portState) ? kPadModeDualShock2
+                      : portState.analogMode       ? kPadModeDualShock
+                                                   : kPadModeDigital;
             data[2] = static_cast<uint8_t>(state.buttons & 0xFFu);
             data[3] = static_cast<uint8_t>((state.buttons >> 8) & 0xFFu);
             data[4] = state.rx;
@@ -261,8 +275,8 @@ namespace ps2_stubs
             data[14] = pressureValue(state, portState, kPadBtnCross);
             data[15] = pressureValue(state, portState, kPadBtnSquare);
             data[16] = pressureValue(state, portState, kPadBtnL1);
-            data[17] = pressureValue(state, portState, kPadBtnL2);
-            data[18] = pressureValue(state, portState, kPadBtnR1);
+            data[17] = pressureValue(state, portState, kPadBtnR1);
+            data[18] = pressureValue(state, portState, kPadBtnL2);
             data[19] = pressureValue(state, portState, kPadBtnR2);
         }
 
@@ -437,9 +451,15 @@ namespace ps2_stubs
         (void)rdram;
         (void)runtime;
         std::lock_guard<std::mutex> lock(g_padStateMutex);
-        const PadPortState *portState = lookupPadPortStateLocked(static_cast<int>(getRegU32(ctx, 4)),
-                                                                 static_cast<int>(getRegU32(ctx, 5)));
-        setReturnS32(ctx, static_cast<int32_t>(portState ? portState->reqState : 0u));
+        PadPortState *portState = lookupPadPortStateLocked(static_cast<int>(getRegU32(ctx, 4)),
+                                                           static_cast<int>(getRegU32(ctx, 5)));
+        int32_t reqState = kPadReqStateComplete;
+        if (portState)
+        {
+            reqState = portState->commandBusy ? kPadReqStateBusy : static_cast<int32_t>(portState->reqState);
+            portState->commandBusy = false;
+        }
+        setReturnS32(ctx, reqState);
     }
 
     void scePadGetSlotMax(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -460,10 +480,10 @@ namespace ps2_stubs
         int32_t state = kPadStateDisconnected;
         if (portState && portState->open)
         {
-            if (portState->transientState != 0u)
+            if (portState->commandBusy)
             {
-                state = static_cast<int32_t>(portState->transientState);
-                portState->transientState = 0u;
+                state = kPadStateExecCmd;
+                portState->commandBusy = false;
             }
             else
             {
@@ -591,7 +611,7 @@ namespace ps2_stubs
         portState->open = false;
         portState->pressureEnabled = false;
         portState->reqState = 0u;
-        portState->transientState = 0u;
+        portState->commandBusy = false;
         setReturnS32(ctx, 1);
     }
 
@@ -615,7 +635,7 @@ namespace ps2_stubs
         portState->buttonMask = 0xFFFFu;
         portState->dmaAddr = dmaAddr;
         portState->reqState = 0u;
-        portState->transientState = 0u;
+        portState->commandBusy = false;
         if (dmaStr)
         {
             ps2TraceGuestRangeWrite(rdram, dmaAddr, 32u, "scePadPortOpen", ctx);
@@ -744,7 +764,6 @@ namespace ps2_stubs
         if (portState && portState->open)
         {
             portState->reqState = static_cast<uint32_t>(getRegU32(ctx, 6) ? 1u : 0u);
-            queueExecCmdStateLocked(*portState);
         }
         setReturnS32(ctx, 1);
     }

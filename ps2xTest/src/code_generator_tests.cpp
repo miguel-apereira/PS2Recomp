@@ -1307,6 +1307,67 @@ void register_code_generator_tests()
                      "PCPYLD should use PS2_PCPYLD helper");
         });
 
+        tc.Run("SQRT.S takes its operand from ft", [](TestCase &t) {
+            CodeGenerator gen({}, {});
+
+            Instruction sqrt{};
+            sqrt.opcode = OPCODE_COP1;
+            sqrt.rs = COP1_S;
+            sqrt.function = COP1_S_SQRT;
+            sqrt.rt = 4; // ft
+            sqrt.rd = 0; // fs, unused
+            sqrt.sa = 2; // fd
+
+            const std::string out = gen.translateInstruction(sqrt);
+            t.IsTrue(out.find("ctx->f[2] = FPU_SQRT_S(ctx->f[4])") != std::string::npos, "SQRT.S fd, ft should read ft");
+        });
+
+        tc.Run("Quadword loads and stores ignore the low four address bits", [](TestCase &t) {
+            CodeGenerator gen({}, {});
+
+            for (uint32_t opcode : {OPCODE_LQ, OPCODE_SQ, OPCODE_LQC2, OPCODE_SQC2})
+            {
+                Instruction inst{};
+                inst.opcode = opcode;
+                inst.rs = 5;
+                inst.rt = 6;
+                inst.simmediate = 4;
+                inst.immediate = 4;
+                const std::string out = gen.translateInstruction(inst);
+                t.IsTrue(out.find("((ADD32(GPR_U32(ctx, 5), 4)) & ~0xFu)") != std::string::npos,
+                         "the quadword address should be masked to 16 bytes");
+            }
+        });
+
+        tc.Run("MMI exchanges and rotates move the right lanes", [](TestCase &t) {
+            CodeGenerator gen({}, {});
+
+            struct LaneCase
+            {
+                uint8_t function;
+                uint8_t subfunction;
+                const char *expected;
+            };
+            const LaneCase cases[] = {
+                {MMI_MMI2, MMI2_PEXEH, "_MM_SHUFFLE(3,0,1,2)), _MM_SHUFFLE(3,0,1,2))"},
+                {MMI_MMI3, MMI3_PEXCH, "_MM_SHUFFLE(3,1,2,0)), _MM_SHUFFLE(3,1,2,0))"},
+                {MMI_MMI3, MMI3_PEXCW, "_mm_shuffle_epi32(GPR_VEC(ctx, 8), _MM_SHUFFLE(3,1,2,0))"},
+                {MMI_MMI2, MMI2_PROT3W, "_mm_shuffle_epi32(GPR_VEC(ctx, 8), _MM_SHUFFLE(3,0,2,1))"},
+            };
+            for (const LaneCase &c : cases)
+            {
+                Instruction inst{};
+                inst.isMMI = true;
+                inst.opcode = OPCODE_MMI;
+                inst.function = c.function;
+                inst.sa = c.subfunction;
+                inst.rd = 6;
+                inst.rt = 8;
+                const std::string out = gen.translateInstruction(inst);
+                t.IsTrue(out.find(c.expected) != std::string::npos, out);
+            }
+        });
+
         tc.Run("Unary MMI permutations read their source from rt", [](TestCase &t) {
             CodeGenerator gen({}, {});
 
@@ -1542,6 +1603,51 @@ void register_code_generator_tests()
             t.IsTrue(out.find("ctx->vi[14]") != std::string::npos, "S2 VLQI base VI should come from rd");
             t.IsTrue(out.find("ctx->vu0_vf[6]") != std::string::npos, "S2 VLQI destination VF should come from rt");
             t.IsTrue(out.find("ctx->vi[20]") == std::string::npos, "S2 VLQI must not use rs(format) as VI index");
+        });
+
+        tc.Run("VU0 S2 stores take the address from rt and the source from rd", [](TestCase &t) {
+            for (uint32_t op : {static_cast<uint32_t>(VU0_S2_VSQI), static_cast<uint32_t>(VU0_S2_VSQD)})
+            {
+                Instruction inst{};
+                inst.opcode = OPCODE_COP2;
+                inst.rs = COP2_CO | 0x4;
+                inst.rt = 3;  // it: the address
+                inst.rd = 12; // fs: the stored register
+                inst.function = 0x3C;
+                inst.vectorInfo.vectorField = 0xF;
+                inst.raw = (((op >> 2) & 0x1F) << 6) | (op & 0x3);
+
+                CodeGenerator gen({}, {});
+                std::string out = gen.translateInstruction(inst);
+
+                t.IsTrue(out.find("ctx->vi[3]") != std::string::npos, "VU0 store address VI should come from rt");
+                t.IsTrue(out.find("ctx->vu0_vf[12]") != std::string::npos, "VU0 store source VF should come from rd");
+                t.IsTrue(out.find("ctx->vi[12]") == std::string::npos, "VU0 store must not address with rd");
+            }
+        });
+
+        tc.Run("VU0 S2 memory ops address VU0 data memory", [](TestCase &t) {
+            for (uint32_t op : {static_cast<uint32_t>(VU0_S2_VLQI), static_cast<uint32_t>(VU0_S2_VSQI),
+                                static_cast<uint32_t>(VU0_S2_VLQD), static_cast<uint32_t>(VU0_S2_VSQD),
+                                static_cast<uint32_t>(VU0_S2_VILWR), static_cast<uint32_t>(VU0_S2_VISWR)})
+            {
+                Instruction inst{};
+                inst.opcode = OPCODE_COP2;
+                inst.rs = COP2_CO | 0x4;
+                inst.rt = 2;
+                inst.rd = 5;
+                inst.function = 0x3C;
+                inst.vectorInfo.vectorField = 0x4; // y
+                inst.raw = (((op >> 2) & 0x1F) << 6) | (op & 0x3);
+
+                CodeGenerator gen({}, {});
+                std::string out = gen.translateInstruction(inst);
+
+                t.IsTrue(out.find("0x11004000u") != std::string::npos, "VU0 memory ops must address VU0 data memory");
+                t.IsTrue(out.find("0xFFu") != std::string::npos, "VU0 memory addresses wrap at 4 KB");
+                if (op == VU0_S2_VILWR || op == VU0_S2_VISWR)
+                    t.IsTrue(out.find("+ 4u") != std::string::npos, "VILWR.y and VISWR.y use the y word");
+            }
         });
 
         tc.Run("JAL to known function emits call and check", [](TestCase &t) {
@@ -2086,33 +2192,89 @@ void register_code_generator_tests()
                      "jalr fallback should not dispatch directly to tail-jump delay slot");
         });
 
-        tc.Run("VU random helpers emit line comments on separate lines", [](TestCase &t) {
+        tc.Run("VU random helpers emit plain statements", [](TestCase &t) {
             CodeGenerator gen({}, {});
 
             Instruction inst{};
             inst.rd = 7;
+            inst.rt = 3;
             inst.vectorInfo.fsf = 2;
+            inst.vectorInfo.vectorField = 0xF;
 
-            std::string vrnext = gen.translateVU_VRNEXT(inst);
-            printGeneratedCode("VU random helpers emit line comments on separate lines - VRNEXT", vrnext);
-            t.IsTrue(vrnext.find("// Simple LFSR-based random number generation (PS2-like behavior)\n"
-                                 "    uint32_t feedback") != std::string::npos,
-                     "VRNEXT should place the generated line comment on its own line");
+            for (const std::string &code : {gen.translateVU_VRNEXT(inst), gen.translateVU_VRINIT(inst), gen.translateVU_VRXOR(inst)})
+            {
+                t.IsTrue(code.find("//") == std::string::npos, "no line comment that could swallow the code after it");
+            }
+            t.IsTrue(gen.translateVU_VRNEXT(inst).find("ctx->vu0_vf[3] =") != std::string::npos, "VRNEXT writes its result to ft");
+        });
 
-            std::string vrinit = gen.translateVU_VRINIT(inst);
-            printGeneratedCode("VU random helpers emit line comments on separate lines - VRINIT", vrinit);
-            t.IsTrue(vrinit.find("// PS2 uses a specific LFSR initialization pattern\n"
-                                 "    if (seed == 0) seed = 1;") != std::string::npos,
-                     "VRINIT should place the generated line comment on its own line");
+        tc.Run("VU0 macro writes to vf0 are undone and FMAC operations set the flags", [](TestCase &t) {
+            CodeGenerator gen({}, {});
+            const std::string restore = "ctx->vu0_vf[0] = _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f);";
 
-            std::string vrxor = gen.translateVU_VRXOR(inst);
-            printGeneratedCode("VU random helpers emit line comments on separate lines - VRXOR", vrxor);
-            t.IsTrue(vrxor.find("// XOR the current random value with the data from the VU vector register\n"
-                                "    __m128i xored") != std::string::npos,
-                     "VRXOR should keep the XOR comment on its own line");
-            t.IsTrue(vrxor.find("// Apply a simple mixing function similar to PS2's LFSR\n"
-                                "    __m128i mixed") != std::string::npos,
-                     "VRXOR should keep the LFSR comment on its own line");
+            // VADDx.xyzw vf0, vf10, vf0x: the game runs this only for the flags.
+            Instruction add{};
+            add.opcode = OPCODE_COP2;
+            add.rs = COP2_CO;
+            add.function = VU0_S1_VADDx;
+            add.sa = 0;
+            add.rd = 10;
+            add.rt = 0;
+            add.vectorInfo.vectorField = 0xF;
+            std::string out = gen.translateInstruction(add);
+            const size_t flags = out.find("ps2_vu0_fmac_flags(ctx->vu0_mac_flags, ctx->vu0_status, ctx->vu0_vf[0], 15);");
+            const size_t undo = out.find(restore);
+            t.IsTrue(flags != std::string::npos, "VADDx sets the flags from its result");
+            t.IsTrue(undo != std::string::npos && undo > flags, "vf0 is put back after the flags are read from it");
+
+            add.sa = 4;
+            out = gen.translateInstruction(add);
+            t.IsTrue(out.find(restore) == std::string::npos, "a write to another register leaves vf0 alone");
+            t.IsTrue(out.find("ctx->vu0_vf[4], 15);") != std::string::npos, "flags come from the register written");
+
+            Instruction mula{};
+            mula.opcode = OPCODE_COP2;
+            mula.rs = COP2_CO;
+            mula.function = 0x3C; // Special2 table
+            mula.raw = (static_cast<uint32_t>(VU0_S2_VMULAx >> 2) << 6) | (VU0_S2_VMULAx & 0x3u) | 0x3Cu;
+            mula.vectorInfo.vectorField = 0x8;
+            out = gen.translateInstruction(mula);
+            t.IsTrue(out.find("ps2_vu0_fmac_flags(ctx->vu0_mac_flags, ctx->vu0_status, ctx->vu0_acc, 8);") != std::string::npos,
+                     "an ACC operation sets the flags from ACC");
+
+            Instruction move{};
+            move.opcode = OPCODE_COP2;
+            move.rs = COP2_CO;
+            move.function = 0x3C;
+            move.raw = (static_cast<uint32_t>(VU0_S2_VMOVE >> 2) << 6) | (VU0_S2_VMOVE & 0x3u) | 0x3Cu;
+            move.rt = 0;
+            move.rd = 5;
+            move.vectorInfo.vectorField = 0xF;
+            out = gen.translateInstruction(move);
+            t.IsTrue(out.find(restore) != std::string::npos, "VMOVE to vf0 is undone");
+            t.IsTrue(out.find("ps2_vu0_fmac_flags") == std::string::npos, "VMOVE does not touch the flags");
+
+            Instruction qmtc2{};
+            qmtc2.opcode = OPCODE_COP2;
+            qmtc2.rs = COP2_QMTC2;
+            qmtc2.rt = 8;
+            qmtc2.rd = 0;
+            t.IsTrue(gen.translateInstruction(qmtc2).find(restore) != std::string::npos, "QMTC2 to vf0 is undone");
+        });
+
+        tc.Run("MOVZ and MOVN move 64 bits", [](TestCase &t) {
+            CodeGenerator gen({}, {});
+            Instruction inst{};
+            inst.opcode = OPCODE_SPECIAL;
+            inst.function = SPECIAL_MOVZ;
+            inst.rd = 2;
+            inst.rs = 3;
+            inst.rt = 4;
+            std::string out = gen.translateInstruction(inst);
+            t.IsTrue(out.find("SET_GPR_U64(ctx, 2, GPR_U64(ctx, 3))") != std::string::npos, "MOVZ writes the low 64 bits only");
+            inst.function = SPECIAL_MOVN;
+            out = gen.translateInstruction(inst);
+            t.IsTrue(out.find("SET_GPR_U64(ctx, 2, GPR_U64(ctx, 3))") != std::string::npos, "MOVN writes the low 64 bits only");
         });
 
         tc.Run("resolveStubTarget allows leading underscore alias", [](TestCase &t) {

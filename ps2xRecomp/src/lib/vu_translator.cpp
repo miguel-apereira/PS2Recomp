@@ -18,6 +18,96 @@ namespace ps2recomp
 
     std::string VuTranslator::translate(const Instruction &inst)
     {
+        std::string code = translateWithoutEpilogue(inst);
+        const std::string epilogue = macroEpilogue(inst);
+        if (epilogue.empty())
+            return code;
+        return "{ " + code + epilogue + " }";
+    }
+
+    // What a VU0 macro instruction does besides writing its result: an FMAC operation sets the MAC and status
+    // flags, and vf0 stays (0,0,0,1) whatever is written to it. The game relies on both: it runs
+    // VADDx.xyzw vf0, vf10, vf0x only to read the sign flags back with CFC2, and hundreds of other macro
+    // instructions read vf0 afterwards.
+    std::string VuTranslator::macroEpilogue(const Instruction &inst)
+    {
+        const uint8_t format = inst.rs;
+        if (format == COP2_QMTC2)
+            return inst.rd == 0 ? " ctx->vu0_vf[0] = _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f);" : "";
+        if (format < COP2_CO)
+            return "";
+
+        int vfWritten = -1;
+        bool fmac = false;
+        const uint8_t special1_func = static_cast<uint8_t>(inst.function & 0x3F);
+        if (special1_func >= 0x3C)
+        {
+            const uint8_t vu_func = static_cast<uint8_t>((((inst.raw >> 6) & 0x1F) << 2) | (inst.raw & 0x3));
+            switch (vu_func)
+            {
+            case VU0_S2_VADDAx: case VU0_S2_VADDAy: case VU0_S2_VADDAz: case VU0_S2_VADDAw:
+            case VU0_S2_VSUBAx: case VU0_S2_VSUBAy: case VU0_S2_VSUBAz: case VU0_S2_VSUBAw:
+            case VU0_S2_VMADDAx: case VU0_S2_VMADDAy: case VU0_S2_VMADDAz: case VU0_S2_VMADDAw:
+            case VU0_S2_VMSUBAx: case VU0_S2_VMSUBAy: case VU0_S2_VMSUBAz: case VU0_S2_VMSUBAw:
+            case VU0_S2_VMULAx: case VU0_S2_VMULAy: case VU0_S2_VMULAz: case VU0_S2_VMULAw:
+            case VU0_S2_VADDA: case VU0_S2_VADDAq: case VU0_S2_VADDAi:
+            case VU0_S2_VSUBA: case VU0_S2_VSUBAq: case VU0_S2_VSUBAi:
+            case VU0_S2_VMADDA: case VU0_S2_VMADDAq: case VU0_S2_VMADDAi:
+            case VU0_S2_VMSUBA: case VU0_S2_VMSUBAq: case VU0_S2_VMSUBAi:
+            case VU0_S2_VMULA: case VU0_S2_VMULAq: case VU0_S2_VMULAi:
+            case VU0_S2_VOPMULA:
+                return fmt::format(" ps2_vu0_fmac_flags(ctx->vu0_mac_flags, ctx->vu0_status, ctx->vu0_acc, {});",
+                                   inst.vectorInfo.vectorField);
+            case VU0_S2_VITOF0: case VU0_S2_VITOF4: case VU0_S2_VITOF12: case VU0_S2_VITOF15:
+            case VU0_S2_VFTOI0: case VU0_S2_VFTOI4: case VU0_S2_VFTOI12: case VU0_S2_VFTOI15:
+            case VU0_S2_VABS: case VU0_S2_VMOVE: case VU0_S2_VMR32:
+            case VU0_S2_VLQI: case VU0_S2_VLQD: case VU0_S2_VMFIR:
+            case VU0_S2_VRNEXT: case VU0_S2_VRGET:
+                vfWritten = inst.rt;
+                break;
+            default:
+                break;
+            }
+        }
+        else
+        {
+            switch (special1_func)
+            {
+            case VU0_S1_VADDx: case VU0_S1_VADDy: case VU0_S1_VADDz: case VU0_S1_VADDw:
+            case VU0_S1_VSUBx: case VU0_S1_VSUBy: case VU0_S1_VSUBz: case VU0_S1_VSUBw:
+            case VU0_S1_VMADDx: case VU0_S1_VMADDy: case VU0_S1_VMADDz: case VU0_S1_VMADDw:
+            case VU0_S1_VMSUBx: case VU0_S1_VMSUBy: case VU0_S1_VMSUBz: case VU0_S1_VMSUBw:
+            case VU0_S1_VMULx: case VU0_S1_VMULy: case VU0_S1_VMULz: case VU0_S1_VMULw:
+            case VU0_S1_VADD: case VU0_S1_VADDq: case VU0_S1_VADDi:
+            case VU0_S1_VSUB: case VU0_S1_VSUBq: case VU0_S1_VSUBi:
+            case VU0_S1_VMUL: case VU0_S1_VMULq: case VU0_S1_VMULi:
+            case VU0_S1_VMADD: case VU0_S1_VMADDq: case VU0_S1_VMADDi:
+            case VU0_S1_VMSUB: case VU0_S1_VMSUBq: case VU0_S1_VMSUBi:
+            case VU0_S1_VOPMSUB:
+                fmac = true;
+                vfWritten = inst.sa;
+                break;
+            case VU0_S1_VMAXx: case VU0_S1_VMAXy: case VU0_S1_VMAXz: case VU0_S1_VMAXw:
+            case VU0_S1_VMINIx: case VU0_S1_VMINIy: case VU0_S1_VMINIz: case VU0_S1_VMINIw:
+            case VU0_S1_VMAX: case VU0_S1_VMAXi: case VU0_S1_VMINI: case VU0_S1_VMINIi:
+                vfWritten = inst.sa;
+                break;
+            default:
+                break;
+            }
+        }
+
+        std::string out;
+        if (fmac)
+            out += fmt::format(" ps2_vu0_fmac_flags(ctx->vu0_mac_flags, ctx->vu0_status, ctx->vu0_vf[{}], {});",
+                               vfWritten, inst.vectorInfo.vectorField);
+        if (vfWritten == 0)
+            out += " ctx->vu0_vf[0] = _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f);";
+        return out;
+    }
+
+    std::string VuTranslator::translateWithoutEpilogue(const Instruction &inst)
+    {
         uint8_t format = inst.rs; // Use parsed rs field for COP2 format
         uint8_t rt = inst.rt;
         uint8_t rd = inst.rd;
@@ -79,7 +169,8 @@ namespace ps2recomp
             switch (rd)
             {
             case VU0_CR_STATUS:
-                return fmt::format("ctx->vu0_status = static_cast<uint16_t>(GPR_U32(ctx, {}) & 0xFFFFu);", rt);
+                // Only the sticky flags (bits 6-11) can be written.
+                return fmt::format("ctx->vu0_status = static_cast<uint16_t>((ctx->vu0_status & 0x3Fu) | (GPR_U32(ctx, {}) & 0xFC0u));", rt);
             case VU0_CR_MAC:
             case VU0_CR_TPC:
             case VU0_CR_VPU_STAT:
@@ -262,24 +353,9 @@ namespace ps2recomp
                         inst.rt, inst.rt);
                 }
                 case VU0_S2_VCLIPw:
-                {
-                    uint8_t field = inst.function & 0x3;
-                    std::string shuffle_pattern = fmt::format("_MM_SHUFFLE({},{},{},{})", field, field, field, field);
-
-                    return fmt::format(
-                        "{{ __m128 fs = ctx->vu0_vf[{}]; "
-                        "__m128 ft = _mm_shuffle_ps(ctx->vu0_vf[{}], ctx->vu0_vf[{}], {}); "
-                        "__m128 neg_ft = _mm_xor_ps(ft, _mm_castsi128_ps(_mm_set1_epi32(0x80000000))); "
-                        "__m128 gt = _mm_cmpgt_ps(fs, ft); "
-                        "__m128 lt = _mm_cmplt_ps(fs, neg_ft); "
-                        "uint32_t gt_mask = (uint32_t)_mm_movemask_ps(gt); "
-                        "uint32_t lt_mask = (uint32_t)_mm_movemask_ps(lt); "
-                        "uint32_t flags = ((lt_mask & 0x1) << 0) | ((gt_mask & 0x1) << 1) | "
-                        "((lt_mask & 0x2) << 1) | ((gt_mask & 0x2) << 2) | "
-                        "((lt_mask & 0x4) << 2) | ((gt_mask & 0x4) << 3); "
-                        "ctx->vu0_clip_flags = ((ctx->vu0_clip_flags << 6) | (flags & 0x3F)) & 0xFFFFFF; }}",
-                        inst.rd, inst.rt, inst.rt, shuffle_pattern);
-                }
+                    // The six new bits go in at the bottom and the older ones move up, 24 bits in all.
+                    return fmt::format("ctx->vu0_clip_flags = ((ctx->vu0_clip_flags << 6) | ps2_vclip(ctx->vu0_vf[{}], ctx->vu0_vf[{}])) & 0xFFFFFF;",
+                                       inst.rd, inst.rt);
                 case VU0_S2_VNOP:
                     return fmt::format("// NOP operation, no action needed for VU0");
                 case VU0_S2_VRNEXT:

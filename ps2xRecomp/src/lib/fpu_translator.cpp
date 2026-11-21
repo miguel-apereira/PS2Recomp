@@ -58,7 +58,8 @@ namespace ps2recomp
                                    "ctx->f[{}] = FPU_DIV_S(ctx->f[{}], ctx->f[{}]); }}",
                                    ft, fd, fs, ft);
             case COP1_S_SQRT:
-                return fmt::format("ctx->f[{}] = FPU_SQRT_S(ctx->f[{}]);", fd, fs);
+                // SQRT.S fd, ft: the R5900 takes its operand from ft, not fs.
+                return fmt::format("ctx->f[{}] = FPU_SQRT_S(ctx->f[{}]);", fd, ft);
             case COP1_S_ABS:
                 return fmt::format("ctx->f[{}] = FPU_ABS_S(ctx->f[{}]);", fd, fs);
             case COP1_S_MOV:
@@ -93,9 +94,9 @@ namespace ps2recomp
             case COP1_S_MSUBA:
                 return fmt::format("FPU_SET_ACC(ctx, FPU_SUB_S(ctx->f_acc, FPU_MUL_S(ctx->f[{}], ctx->f[{}])));", fs, ft);
             case COP1_S_MAX:
-                return fmt::format("ctx->f[{}] = std::max(ctx->f[{}], ctx->f[{}]);", fd, fs, ft);
+                return fmt::format("ctx->f[{}] = ps2_fmax(ctx->f[{}], ctx->f[{}]);", fd, fs, ft);
             case COP1_S_MIN:
-                return fmt::format("ctx->f[{}] = std::min(ctx->f[{}], ctx->f[{}]);", fd, fs, ft);
+                return fmt::format("ctx->f[{}] = ps2_fmin(ctx->f[{}], ctx->f[{}]);", fd, fs, ft);
             case COP1_S_C_F:
                 return fmt::format("ctx->fcr31 &= ~0x800000;");
             case COP1_S_C_UN:

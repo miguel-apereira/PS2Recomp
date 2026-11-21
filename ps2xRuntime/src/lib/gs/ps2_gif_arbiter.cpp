@@ -20,7 +20,10 @@ bool GifArbiter::isImagePacket(const uint8_t *data, uint32_t sizeBytes)
 
 void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool path2DirectHl)
 {
-    if (!data || sizeBytes < 16 || !m_processFn)
+    if (!data || sizeBytes < 16)
+        return;
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    if (!m_processFn)
         return;
 
     GifArbiterPacket pkt;
@@ -32,34 +35,63 @@ void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeByte
     m_queue.push_back(std::move(pkt));
 }
 
+void GifArbiter::submitAndDrain(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool path2DirectHl)
+{
+    if (!data || sizeBytes < 16)
+        return;
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    if (!m_processFn)
+        return;
+    if (m_queue.empty())
+    {
+        // Alone in the queue, it would be sent first anyway.
+        m_processFn(data, sizeBytes);
+        drain(); // anything the GS submitted meanwhile, on this thread
+        return;
+    }
+    submit(pathId, data, sizeBytes, path2DirectHl);
+    drain();
+}
+
 void GifArbiter::drain()
 {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
     if (!m_processFn)
         return;
 
-    std::stable_sort(m_queue.begin(), m_queue.end(),
-                     [](const GifArbiterPacket &a, const GifArbiterPacket &b)
-                     {
-                         // DIRECTHL cannot preempt PATH3 IMAGE transfers.
-                         if (a.path2DirectHl != b.path2DirectHl || a.path3Image != b.path3Image)
-                         {
-                             if (a.path3Image && b.path2DirectHl)
-                                 return true;
-                             if (a.path2DirectHl && b.path3Image)
-                                 return false;
-                         }
-                         return pathPriority(a.pathId) < pathPriority(b.pathId);
-                     });
-
-    for (size_t i = 0; i < m_queue.size(); ++i)
+    // Taken out of the queue first, so a packet submitted while these are
+    // processed (from the GS, on this thread) goes into the next round
+    // instead of changing this one.
+    while (!m_queue.empty())
     {
-        auto &pkt = m_queue[i];
-        if (!pkt.data.empty())
+        std::vector<GifArbiterPacket> packets;
+        packets.swap(m_queue);
+        std::stable_sort(packets.begin(), packets.end(),
+                         [](const GifArbiterPacket &a, const GifArbiterPacket &b)
+                         {
+                             // DIRECTHL cannot preempt PATH3 IMAGE transfers.
+                             if (a.path2DirectHl != b.path2DirectHl || a.path3Image != b.path3Image)
+                             {
+                                 if (a.path3Image && b.path2DirectHl)
+                                     return true;
+                                 if (a.path2DirectHl && b.path3Image)
+                                     return false;
+                             }
+                             return pathPriority(a.pathId) < pathPriority(b.pathId);
+                         });
+
+        for (const GifArbiterPacket &pkt : packets)
         {
-            m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
+            if (!pkt.data.empty())
+            {
+                m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
+            }
         }
+        // Give the storage back to the queue for the next packets.
+        packets.clear();
+        if (m_queue.empty())
+            m_queue.swap(packets);
     }
-    m_queue.clear();
 }
 
 uint8_t GifArbiter::pathPriority(GifPathId id)

@@ -238,6 +238,51 @@ void register_pad_input_tests()
             closePadPort(ctx, rdram);
         });
 
+        tc.Run("a pad command reports BUSY to the first request poll, then COMPLETE and STABLE", [](TestCase &t)
+               {
+            // Polling order of games that check the request before the state
+            // (The Getaway: GetReqState while a command is pending, then GetState and Read).
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0);
+            R5900Context ctx;
+
+            ps2_stubs::scePadInit(rdram.data(), &ctx, nullptr);
+            openPadPort(ctx, rdram);
+
+            const auto commandThenPoll = [&](void (*command)(uint8_t *, R5900Context *, PS2Runtime *), const char *name)
+            {
+                setRegU32(ctx, 4, 0u);
+                setRegU32(ctx, 5, 0u);
+                setRegU32(ctx, 6, 1u);
+                setRegU32(ctx, 7, 3u);
+                command(rdram.data(), &ctx, nullptr);
+                t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(1), name);
+
+                setRegU32(ctx, 4, 0u);
+                setRegU32(ctx, 5, 0u);
+                ps2_stubs::scePadGetReqState(rdram.data(), &ctx, nullptr);
+                t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(2), "first request poll should be BUSY");
+
+                setRegU32(ctx, 4, 0u);
+                setRegU32(ctx, 5, 0u);
+                ps2_stubs::scePadGetReqState(rdram.data(), &ctx, nullptr);
+                t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(0), "next request poll should be COMPLETE");
+
+                setRegU32(ctx, 4, 0u);
+                setRegU32(ctx, 5, 0u);
+                ps2_stubs::scePadGetState(rdram.data(), &ctx, nullptr);
+                t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(6), "state should be STABLE once the request completed");
+            };
+
+            commandThenPoll(ps2_stubs::scePadSetMainMode, "scePadSetMainMode should succeed");
+            commandThenPoll(ps2_stubs::scePadEnterPressMode, "scePadEnterPressMode should succeed");
+
+            runPadRead(ctx, rdram);
+            t.Equals(rdram[kPadDataAddr + 0], static_cast<uint8_t>(0x00), "read status byte should be 0");
+            t.Equals(rdram[kPadDataAddr + 1], static_cast<uint8_t>(0x79), "analog + pressure mode should read as a DualShock 2 (0x79)");
+
+            closePadPort(ctx, rdram);
+        });
+
         tc.Run("pad info and mode helpers return consistent values", [](TestCase &t)
                {
             std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0);
@@ -433,6 +478,13 @@ void register_pad_input_tests()
 
             setRegU32(ctx, 4, 0u);
             setRegU32(ctx, 5, 0u);
+            setRegU32(ctx, 6, 1u);
+            setRegU32(ctx, 7, 3u);
+            ps2_stubs::scePadSetMainMode(rdram.data(), &ctx, nullptr);
+            t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(1), "pressure mode needs analog mode first");
+
+            setRegU32(ctx, 4, 0u);
+            setRegU32(ctx, 5, 0u);
             ps2_stubs::scePadEnterPressMode(rdram.data(), &ctx, nullptr);
             t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(1), "scePadEnterPressMode should enable pressure data");
 
@@ -442,11 +494,12 @@ void register_pad_input_tests()
                                                                    ~kPadBtnTriangle &
                                                                    ~kPadBtnCross &
                                                                    ~kPadBtnL1 &
-                                                                   ~kPadBtnR2);
+                                                                   ~kPadBtnL2);
             ps2_stubs::setPadOverrideState(pressedButtons, 0x80, 0x80, 0x80, 0x80);
             runPadRead(ctx, rdram);
 
             const uint8_t *data = rdram.data() + kPadDataAddr;
+            t.Equals(data[1], static_cast<uint8_t>(0x79), "mode byte should be 0x79 (DualShock 2 pressure mode)");
             t.Equals(data[8], static_cast<uint8_t>(0x00), "right pressure should be clear when not pressed");
             t.Equals(data[9], static_cast<uint8_t>(0xFF), "left pressure should be populated when pressed");
             t.Equals(data[10], static_cast<uint8_t>(0xFF), "up pressure should be populated when pressed");
@@ -456,13 +509,13 @@ void register_pad_input_tests()
             t.Equals(data[14], static_cast<uint8_t>(0xFF), "cross pressure should be populated when pressed");
             t.Equals(data[15], static_cast<uint8_t>(0x00), "square pressure should be clear when not pressed");
             t.Equals(data[16], static_cast<uint8_t>(0xFF), "L1 pressure should be populated when pressed");
-            t.Equals(data[17], static_cast<uint8_t>(0x00), "L2 pressure should be clear when not pressed");
-            t.Equals(data[18], static_cast<uint8_t>(0x00), "R1 pressure should be clear when not pressed");
-            t.Equals(data[19], static_cast<uint8_t>(0xFF), "R2 pressure should be populated when pressed");
+            t.Equals(data[17], static_cast<uint8_t>(0x00), "R1 pressure should be clear when not pressed");
+            t.Equals(data[18], static_cast<uint8_t>(0xFF), "L2 pressure should be populated when pressed");
+            t.Equals(data[19], static_cast<uint8_t>(0x00), "R2 pressure should be clear when not pressed");
 
             setRegU32(ctx, 4, 0u);
             setRegU32(ctx, 5, 0u);
-            setRegU32(ctx, 6, static_cast<uint32_t>(kPadBtnL1 | kPadBtnR2));
+            setRegU32(ctx, 6, static_cast<uint32_t>(kPadBtnL1 | kPadBtnL2));
             ps2_stubs::scePadSetButtonInfo(rdram.data(), &ctx, nullptr);
             t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(1), "scePadSetButtonInfo should narrow the enabled pressure mask");
 
@@ -473,7 +526,16 @@ void register_pad_input_tests()
             t.Equals(data[12], static_cast<uint8_t>(0x00), "masked-out face-button pressure should clear");
             t.Equals(data[14], static_cast<uint8_t>(0x00), "masked-out face-button pressure should clear");
             t.Equals(data[16], static_cast<uint8_t>(0xFF), "enabled L1 pressure should remain populated");
-            t.Equals(data[19], static_cast<uint8_t>(0xFF), "enabled R2 pressure should remain populated");
+            t.Equals(data[18], static_cast<uint8_t>(0xFF), "enabled L2 pressure should remain populated");
+
+            setRegU32(ctx, 4, 0u);
+            setRegU32(ctx, 5, 0u);
+            setRegU32(ctx, 6, 0u);
+            setRegU32(ctx, 7, 3u);
+            ps2_stubs::scePadSetMainMode(rdram.data(), &ctx, nullptr);
+            runPadRead(ctx, rdram);
+            t.Equals(data[1], static_cast<uint8_t>(0x41), "digital mode should not report pressure mode");
+            t.Equals(data[16], static_cast<uint8_t>(0x00), "digital mode should not report pressure bytes");
 
             ps2_stubs::clearPadOverrideState();
             closePadPort(ctx, rdram);

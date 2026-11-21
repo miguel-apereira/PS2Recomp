@@ -705,6 +705,28 @@ void register_ps2_gs_tests()
                      "sceGsSwapDBuffDc should honor a clear packet seeded from register-based trailing args");
         });
 
+        tc.Run("a SIGNAL arriving while CSR.SIGNAL is set waits until the CPU clears it", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GSRegisters regs{};
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), &regs);
+
+            gs.writeRegister(GS_REG_SIGNAL, 0xFFFFFFFF00000001ull);
+            gs.writeRegister(GS_REG_SIGNAL, 0xFFFFFFFF00000002ull);
+            t.Equals(regs.csr.load() & 0x1ull, 0x1ull, "the first SIGNAL should set CSR.SIGNAL");
+            t.Equals(regs.siglblid & 0xFFFFFFFFull, 0x1ull, "the second SIGNAL should wait, leaving SIGLBLID");
+            t.IsFalse(gs.releaseDeferredSignal(), "nothing is released while CSR.SIGNAL is still set");
+
+            regs.csr.fetch_and(~0x1ull); // the CPU clears it
+            t.IsTrue(gs.releaseDeferredSignal(), "the waiting SIGNAL should be released once CSR.SIGNAL is clear");
+            t.Equals(regs.csr.load() & 0x1ull, 0x1ull, "the released SIGNAL should set CSR.SIGNAL again");
+            t.Equals(regs.siglblid & 0xFFFFFFFFull, 0x2ull, "the released SIGNAL should update SIGLBLID");
+
+            regs.csr.fetch_and(~0x1ull);
+            t.IsFalse(gs.releaseDeferredSignal(), "only the SIGNALs that waited are released");
+        });
+
         tc.Run("clearFramebufferContext clears the requested context even if another context is active", [](TestCase &t)
         {
             std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);

@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <array>
+#include <limits>
 #include <functional>
 #include <vector>
 #include <unordered_map>
@@ -98,6 +99,75 @@ struct JumpTable
     std::vector<uint32_t> targets; // Jump targets
 };
 
+// The I/O registers (and the few other addresses written through the same
+// path), as std::unordered_map<uint32_t, uint32_t> was used: operator[] makes
+// an entry, count() and find() say whether one exists. The word-aligned
+// addresses of the 64 KB I/O page live in a flat table, since every DMA, VIF
+// and timer access goes through here; any other address in a map.
+class IoRegisterFile
+{
+public:
+    struct Entry
+    {
+        uint32_t first;  // the address
+        uint32_t second; // the value
+    };
+
+    IoRegisterFile()
+    {
+        for (uint32_t i = 0; i < kWords; ++i)
+            m_flat[i] = {PS2_IO_BASE + i * 4u, 0u};
+    }
+
+    uint32_t &operator[](uint32_t address)
+    {
+        const uint32_t offset = address - PS2_IO_BASE;
+        if (offset < PS2_IO_SIZE && (offset & 3u) == 0u)
+        {
+            m_present[offset >> 2] = 1u;
+            return m_flat[offset >> 2].second;
+        }
+        Entry &e = m_other[address];
+        e.first = address;
+        return e.second;
+    }
+
+    size_t count(uint32_t address) const
+    {
+        const uint32_t offset = address - PS2_IO_BASE;
+        if (offset < PS2_IO_SIZE && (offset & 3u) == 0u)
+            return m_present[offset >> 2];
+        return m_other.count(address);
+    }
+
+    Entry *find(uint32_t address)
+    {
+        const uint32_t offset = address - PS2_IO_BASE;
+        if (offset < PS2_IO_SIZE && (offset & 3u) == 0u)
+            return m_present[offset >> 2] ? &m_flat[offset >> 2] : nullptr;
+        const auto it = m_other.find(address);
+        return it == m_other.end() ? nullptr : &it->second;
+    }
+
+    const Entry *find(uint32_t address) const { return const_cast<IoRegisterFile *>(this)->find(address); }
+    Entry *end() { return nullptr; }
+    const Entry *end() const { return nullptr; }
+
+    void clear()
+    {
+        for (uint32_t i = 0; i < kWords; ++i)
+            m_flat[i].second = 0u;
+        m_present.fill(0u);
+        m_other.clear();
+    }
+
+private:
+    static constexpr uint32_t kWords = PS2_IO_SIZE / 4u;
+    std::array<Entry, kWords> m_flat;
+    std::array<uint8_t, kWords> m_present{};
+    std::unordered_map<uint32_t, Entry> m_other;
+};
+
 class PS2Memory
 {
 public:
@@ -149,13 +219,48 @@ public:
 
     // EE timers advance from the scheduler's emulated EE-cycle clock. The
     // returned mask uses bits 0..3 for newly raised TIM0..TIM3 interrupts.
-    uint32_t advanceEeTimers(uint64_t eeCycles) noexcept;
+    // The scheduler calls this at every guest checkpoint, so it only adds the
+    // cycles up until the next timer interrupt is due; the timers catch up
+    // then, or when the guest accesses a timer register.
+    uint32_t advanceEeTimers(uint64_t eeCycles) noexcept
+    {
+        if (eeCycles == 0u)
+            return 0u;
+        if (m_gifFifoCountSet)
+            clearGifFifoCount();
+        m_eeTimerPendingCycles += eeCycles;
+        return m_eeTimerPendingCycles < m_eeTimerDueCycles ? 0u : syncEeTimers();
+    }
     [[nodiscard]] uint64_t cyclesUntilNextEeTimerInterrupt() const noexcept;
     void resetEeTimers() noexcept;
 
     using GifPacketCallback = std::function<void(const uint8_t *, uint32_t)>;
     void setGifPacketCallback(GifPacketCallback cb) { m_gifPacketCallback = std::move(cb); }
     void setGifArbiter(GifArbiter *arbiter) { m_gifArbiter = arbiter; }
+    // Reads up to size bytes of a GS local-to-host transfer into dst and
+    // returns how many it read. VIF1 DMA to memory (CHCR.DIR = 0) uses it.
+    using GsDownloadCallback = std::function<uint32_t(uint8_t *dst, uint32_t size)>;
+    void setGsDownloadCallback(GsDownloadCallback cb) { m_gsDownloadCallback = std::move(cb); }
+    // A host can serve a VIF1 download itself (a late read-back, say): the
+    // hook fills dst (size bytes, zeroed) and returns true, and the EE goes
+    // on without waiting for the host's VIF1 thread. False: the usual way
+    // (sync, then the download callback).
+    using GsDownloadHook = std::function<bool(uint8_t *dst, uint32_t size)>;
+    void setGsDownloadHook(GsDownloadHook hook) { m_gsDownloadHook = std::move(hook); }
+    // When set, an EE write to a display register (the privileged registers
+    // below CSR: PMODE ... BGCOLOR) takes no GS sync: the register takes the
+    // value at once (what the EE reads back), and the hook gets the register's
+    // offset from the GS privileged base and its new 64-bit value, for the host
+    // to pass on in order with the GS work queued before the write.
+    using GsDisplayWriteHook = std::function<void(uint32_t offset, uint64_t value)>;
+    void setGsDisplayWriteHook(GsDisplayWriteHook hook) { m_gsDisplayWriteHook = std::move(hook); }
+    // When on, an EE write to CSR that only clears event bits (SIGNAL,
+    // FINISH, HSINT, VSINT, EDWINT) and any write to IMR take no GS sync:
+    // they apply at once (CSR as an atomic read-modify-write), as an interrupt
+    // handler's acknowledge does. Events the GS work queued before the write
+    // raises later set their bits again then. For a host that drains GS
+    // events itself (frame pipelining, say); off by default.
+    void setGsEventWritesUnsynced(bool on) { m_gsEventWritesUnsynced = on; }
 
     // Routes the IPU registers, FIFOs and DMA channels 3/4 to a host IPU.
     void setIpuDevice(PS2IpuDevice *device) { m_ipu = device; }
@@ -165,7 +270,57 @@ public:
     // Interrupts raised by devices since the last call, as cause bit masks
     // (INTC causes, DMAC channels). The EE scheduler dispatches them.
     uint32_t takePendingIntc() { return m_pendingIntc.exchange(0u, std::memory_order_acq_rel); }
+    // Raises INTC causes (a bit per cause) from any thread; the scheduler
+    // dispatches them at its next checkpoint.
+    void raisePendingIntc(uint32_t causes) { m_pendingIntc.fetch_or(causes, std::memory_order_acq_rel); }
+
+    // A host that runs VIF1 and VU1 on a thread of its own installs a hook
+    // that waits until that thread has nothing in progress. It is called
+    // before the EE side touches what that thread also uses: VU1 code and
+    // data memory, the GS privileged registers, the GIF registers, PATH3
+    // and GS downloads. The hook must return at once when called on the
+    // VU1 thread itself.
+    // The reason says which access asked for the sync (for stats).
+    enum class GsSyncReason : uint8_t
+    {
+        Vu1Memory,   // a guest pointer into VU1 code or data memory
+        GsPrivRead,  // a GS privileged register read
+        GsPrivWrite, // a GS privileged register write
+        GifRegister, // a GIF register read or write
+        Path3,       // a PATH3 packet to the GS
+        GsDownload,  // a GS-to-memory transfer (VIF1 DMA from the GS)
+        Count
+    };
+    using GsSyncHook = std::function<void(GsSyncReason)>;
+    void setGsSyncHook(GsSyncHook hook) { m_gsSyncHook = std::move(hook); }
+    void syncGsAccess(GsSyncReason reason) const
+    {
+        if (m_gsSyncHook)
+            m_gsSyncHook(reason);
+    }
     uint32_t takePendingDmac() { return m_pendingDmac.exchange(0u, std::memory_order_acq_rel); }
+
+    // A host whose VIF1 thread sends the GS what it gets in order can take
+    // the EE's PATH3 packets too: the hook queues the packet behind what the
+    // EE sent VIF1 before it and returns true, and the EE goes on without
+    // waiting for that thread. It returns false where the packet must go to
+    // the GS here and now (on the host's own threads, which send them on).
+    // With the hook set, GIF_MODE writes and GIF_STAT reads don't wait for
+    // that thread either: they touch nothing it uses. The EE no longer
+    // drains the GIF after its DMA then (the host drains after each packet).
+    using Path3Hook = std::function<bool(const uint8_t *data, uint32_t sizeBytes, bool drainImmediately)>;
+    void setPath3Hook(Path3Hook hook) { m_path3Hook = std::move(hook); }
+    // A GIF DMA chain's payloads in guest memory, in order: one PATH3 packet.
+    struct GatherPiece
+    {
+        const uint8_t *data;
+        uint32_t bytes;
+    };
+    // Like the path3 hook, for a source chain on the GIF channel, which then
+    // needs no copy of its own: true when the hook took the packet. Called
+    // at once, while the pieces still hold what the DMA read.
+    using Path3GatherHook = std::function<bool(const GatherPiece *pieces, size_t count, uint32_t sizeBytes)>;
+    void setPath3GatherHook(Path3GatherHook hook) { m_path3GatherHook = std::move(hook); }
 
     using Vu1MscalCallback = std::function<void(uint32_t startPC, uint32_t top, uint32_t itop)>;
     void setVu1MscalCallback(Vu1MscalCallback cb) { m_vu1MscalCallback = std::move(cb); }
@@ -229,7 +384,8 @@ public:
     std::atomic<uint64_t> m_vu0CodeGeneration{0};
     std::atomic<uint64_t> m_vu1CodeGeneration{0};
     // I/O registers
-    std::unordered_map<uint32_t, uint32_t> m_ioRegisters;
+    IoRegisterFile m_ioRegisters;
+    size_t m_chainBytesHint = 4096; // bytes to reserve for the next DMA chain (the last one's, and a quarter)
 
     // Registers
     GSRegisters gs_regs;
@@ -251,10 +407,17 @@ public:
 
     GifPacketCallback m_gifPacketCallback;
     GifArbiter *m_gifArbiter = nullptr;
+    GsDownloadCallback m_gsDownloadCallback;
+    GsDownloadHook m_gsDownloadHook;
+    GsDisplayWriteHook m_gsDisplayWriteHook;
+    bool m_gsEventWritesUnsynced = false;
     PS2IpuDevice *m_ipu = nullptr;
     uint32_t m_ipuInWords[4] = {};
     uint32_t m_ipuOutWords[4] = {};
     std::atomic<uint32_t> m_pendingIntc{0};
+    GsSyncHook m_gsSyncHook;
+    Path3Hook m_path3Hook;
+    Path3GatherHook m_path3GatherHook;
     std::atomic<uint32_t> m_pendingDmac{0};
 
     void serviceIpu();
@@ -268,7 +431,7 @@ public:
     uint8_t *m_vu0Data = nullptr;
     uint8_t *m_vu1Code = nullptr;
     uint8_t *m_vu1Data = nullptr;
-    bool m_path3Masked = false;
+    std::atomic<bool> m_path3Masked{false}; // VIF1's thread sets it; GIF_STAT reads it
     uint32_t m_vif1PendingPath2ImageQwc = 0u;
     bool m_vif1PendingPath2DirectHl = false;
     std::vector<std::vector<uint8_t>> m_path3MaskedFifo;
@@ -279,6 +442,9 @@ public:
         uint32_t srcAddr = 0;
         uint32_t qwc = 0;
         std::vector<uint8_t> chainData;
+        // Or a GIF chain's payloads in place (m_path3GatherHook), pieceBytes in all.
+        std::vector<GatherPiece> pieces;
+        uint32_t pieceBytes = 0;
     };
     std::vector<PendingTransfer> m_pendingGifTransfers;
     std::vector<PendingTransfer> m_pendingVif0Transfers;
@@ -311,6 +477,13 @@ public:
     };
 
     std::array<EeTimer, 4> m_eeTimers{};
+    uint64_t m_eeTimerPendingCycles = 0;                                   // not yet applied to m_eeTimers
+    uint64_t m_eeTimerDueCycles = std::numeric_limits<uint64_t>::max(); // from m_eeTimers to the next interrupt
+    bool m_gifFifoCountSet = false;                                        // GIF_STAT.FQC may be nonzero
+    uint32_t stepEeTimers(uint64_t eeCycles) noexcept;
+    uint32_t syncEeTimers() noexcept;
+    [[nodiscard]] uint64_t cyclesUntilEeTimerEvent() const noexcept;
+    void clearGifFifoCount() noexcept;
     bool tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr);
     void completeDmacChannel(uint32_t channelBase, uint32_t cause);
     void queueCompletedDmacCause(uint32_t cause);

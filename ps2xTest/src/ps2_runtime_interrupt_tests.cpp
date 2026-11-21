@@ -72,6 +72,10 @@ namespace
     constexpr uint32_t kInvocationQueuePc = 0x00160530u;
     constexpr uint32_t kInvocationQueueResumePc = 0x00160540u;
     constexpr uint32_t kInvocationQueueHandlerPc = 0x00160550u;
+    constexpr uint32_t kVu0WaitPc = 0x00160600u;
+    constexpr uint32_t kVu0ResumePc = 0x00160610u;
+    constexpr uint32_t kVu0HandlerPc = 0x00160620u;
+    constexpr uint32_t kSlowHostPc = 0x00160700u;
 
     constexpr uint32_t kTimer2Count = 0x10001000u;
     constexpr uint32_t kTimer2Mode = 0x10001010u;
@@ -97,6 +101,10 @@ namespace
     uint32_t g_invocationQueueRuns = 0u;
     uint32_t g_invocationQueueSp = 0u;
     bool g_invocationQueueSpChanged = false;
+    float g_vu0HandlerVf5[4] = {};
+    float g_vu0HandlerVf0W = 0.0f;
+    uint16_t g_vu0HandlerVi3 = 0u;
+    float g_vu0ResumedVf6[4] = {};
 
     void setRegU32(R5900Context &ctx, int reg, uint32_t value)
     {
@@ -147,6 +155,93 @@ namespace
         return pred();
     }
 
+    // A guest loop on a host slower than the PS2: each pass runs 200,000
+    // EE cycles in 2 ms of host time (about a third of PS2 speed).
+    constexpr uint32_t kSlowHostPassCycles = 200000u;
+    constexpr auto kSlowHostRun = std::chrono::milliseconds(200);
+    std::chrono::steady_clock::time_point g_slowHostStart{};
+    uint64_t g_slowHostTicks = 0u;
+    uint64_t g_slowHostPasses = 0u;
+    uint64_t g_slowHostLargestStep = 0u;
+    uint64_t g_slowHostLastCycle = 0u;
+
+    void slowHostLoop(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        EeScheduler &scheduler = runtime->eeScheduler();
+        g_slowHostLargestStep = std::max(g_slowHostLargestStep, scheduler.eeCycle() - g_slowHostLastCycle);
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        scheduler.accountCycles(kSlowHostPassCycles);
+        ++g_slowHostPasses;
+        g_slowHostLastCycle = scheduler.eeCycle();
+        g_slowHostTicks = scheduler.currentVSyncTick();
+        if (std::chrono::steady_clock::now() - g_slowHostStart >= kSlowHostRun)
+        {
+            ctx->pc = 0u;
+            runtime->requestStop();
+            return;
+        }
+        ctx->pc = kSlowHostPc;
+    }
+
+    void runSlowHost(TestEnv &env, bool catchUp, bool clockCatchUp = true)
+    {
+        env.runtime.registerFunction(kSlowHostPc, slowHostLoop);
+        g_slowHostTicks = 0u;
+        g_slowHostPasses = 0u;
+        g_slowHostLargestStep = 0u;
+        g_slowHostLastCycle = 0u;
+        R5900Context mainContext{};
+        mainContext.pc = kSlowHostPc;
+        EeScheduler &scheduler = env.runtime.eeScheduler();
+        scheduler.reset(env.rdram.data(), mainContext);
+        scheduler.setVBlankCatchUp(catchUp);
+        scheduler.setClockCatchUp(clockCatchUp);
+        g_slowHostStart = std::chrono::steady_clock::now();
+        scheduler.run();
+    }
+
+    // A guest whose EE stands still in a memory access most of the time
+    // (a GS register write waiting for VU1): each pass runs 10,000 EE cycles
+    // after a 20 ms stall, and tells the scheduler about the stall or not.
+    bool g_creditStalls = false;
+
+    void stallingHostLoop(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        EeScheduler &scheduler = runtime->eeScheduler();
+        const auto start = std::chrono::steady_clock::now();
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        if (g_creditStalls)
+        {
+            scheduler.creditStall(std::chrono::steady_clock::now() - start);
+        }
+        scheduler.accountCycles(10000u);
+        ++g_slowHostPasses;
+        g_slowHostTicks = scheduler.currentVSyncTick();
+        if (std::chrono::steady_clock::now() - g_slowHostStart >= kSlowHostRun)
+        {
+            ctx->pc = 0u;
+            runtime->requestStop();
+            return;
+        }
+        ctx->pc = kSlowHostPc;
+    }
+
+    void runStallingHost(TestEnv &env, bool creditStalls)
+    {
+        env.runtime.registerFunction(kSlowHostPc, stallingHostLoop);
+        g_creditStalls = creditStalls;
+        g_slowHostTicks = 0u;
+        g_slowHostPasses = 0u;
+        R5900Context mainContext{};
+        mainContext.pc = kSlowHostPc;
+        EeScheduler &scheduler = env.runtime.eeScheduler();
+        scheduler.reset(env.rdram.data(), mainContext);
+        scheduler.setVBlankCatchUp(true);
+        scheduler.setClockCatchUp(true);
+        g_slowHostStart = std::chrono::steady_clock::now();
+        scheduler.run();
+    }
+
     void cleanupRuntime(TestEnv &env)
     {
         env.runtime.requestStop();
@@ -194,6 +289,34 @@ namespace
     void schedulerIrqResume(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
     {
         g_dispatchTrace.push_back(3);
+        ctx->pc = 0u;
+        runtime->requestStop();
+    }
+
+    // VU0 is one unit: an interrupt handler sees the registers the
+    // interrupted thread left, and the thread sees what the handler left.
+    void schedulerVu0Handler(uint8_t *, R5900Context *ctx, PS2Runtime *)
+    {
+        _mm_storeu_ps(g_vu0HandlerVf5, ctx->vu0_vf[5]);
+        g_vu0HandlerVf0W = _mm_cvtss_f32(_mm_shuffle_ps(ctx->vu0_vf[0], ctx->vu0_vf[0], _MM_SHUFFLE(3, 3, 3, 3)));
+        g_vu0HandlerVi3 = ctx->vi[3];
+        ctx->vu0_vf[6] = _mm_set_ps(8.0f, 7.0f, 6.0f, 5.0f);
+        ctx->pc = 0u;
+    }
+
+    void schedulerVu0Wait(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        EeScheduler &scheduler = runtime->eeScheduler();
+        scheduler.addIrqHandler(false, 2u, kVu0HandlerPc, true, 0u, 0u, 0u);
+        ctx->vu0_vf[5] = _mm_set_ps(4.0f, 3.0f, 2.0f, 1.0f);
+        ctx->vi[3] = 0x1234u;
+        ctx->pc = kVu0ResumePc;
+        scheduler.waitVSync(scheduler.currentVSyncTick());
+    }
+
+    void schedulerVu0Resume(uint8_t *, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        _mm_storeu_ps(g_vu0ResumedVf6, ctx->vu0_vf[6]);
         ctx->pc = 0u;
         runtime->requestStop();
     }
@@ -525,6 +648,88 @@ void register_ps2_runtime_interrupt_tests()
                      "the first VBlank should publish GS CSR.FIELD before resuming guest code");
         });
 
+        tc.Run("EE overclock divides the charges for guest code", [](TestCase &t)
+        {
+            TestEnv env;
+            EeScheduler &scheduler = env.runtime.eeScheduler();
+            t.Equals(scheduler.guestCycles(32u), 32u, "no overclock by default");
+            scheduler.setOverclock(200u);
+            t.Equals(scheduler.overclock(), 200u, "the overclock reads back");
+            t.Equals(scheduler.guestCycles(32u), 16u, "twice the speed: half the cycles");
+            t.Equals(scheduler.guestCycles(8u), 4u, "dispatches too");
+            scheduler.setOverclock(400u);
+            t.Equals(scheduler.guestCycles(32u), 8u, "four times the speed");
+            t.Equals(scheduler.guestCycles(1u), 1u, "never less than a cycle");
+            scheduler.setOverclock(100u);
+            t.Equals(scheduler.guestCycles(32u), 32u, "back to PS2 speed");
+        });
+
+        tc.Run("VBlank waits for EE cycles when catch-up is off (slow host = slow motion)", [](TestCase &t)
+        {
+            TestEnv env;
+            runSlowHost(env, false);
+            // 200 ms of host time is 12 VBlanks; the EE ran at most a third of that.
+            t.IsTrue(g_slowHostTicks <= 5u, "VBlanks should follow the EE's cycles");
+        });
+
+        tc.Run("VBlank catch-up keeps host time when the EE falls behind; the EE clock catches up at each early VBlank",
+               [](TestCase &t)
+        {
+            TestEnv env;
+            runSlowHost(env, true);
+            const EeScheduler::VBlankCatchUpStats stats = env.runtime.eeScheduler().takeVBlankCatchUpStats();
+            t.IsTrue(g_slowHostTicks >= 9u && g_slowHostTicks <= 12u, "VBlanks should follow host time (12 in 200 ms)");
+            t.IsTrue(stats.caughtUp >= 6u, "most VBlanks should come early");
+            t.IsTrue(stats.clockCycles > 0u, "the EE clock should move on at the early VBlanks");
+            t.Equals(stats.dropped, 0ull, "nothing should be dropped this close to host time");
+            // The clock stands at a VBlank's own cycle after each one: about
+            // one VBlank period (4.9M cycles) per tick, not the third of it
+            // the guest ran.
+            const uint64_t cycle = env.runtime.eeScheduler().eeCycle();
+            t.IsTrue(cycle >= (g_slowHostTicks - 1u) * 4900000ull,
+                     "the EE clock should keep up with the VBlanks");
+            t.IsTrue(cycle <= g_slowHostPasses * kSlowHostPassCycles + (g_slowHostTicks + 1u) * 4916000ull,
+                     "the EE clock should not run ahead of them");
+        });
+
+        tc.Run("EE stalls in memory accesses count in the EE clock, up to real time", [](TestCase &t)
+        {
+            TestEnv env;
+            runStallingHost(env, true);
+            const auto elapsed = std::chrono::steady_clock::now() - g_slowHostStart;
+            const EeScheduler::VBlankCatchUpStats stats = env.runtime.eeScheduler().takeVBlankCatchUpStats();
+            t.IsTrue(stats.stallCycles > 0u, "the stalls should be counted");
+            t.IsTrue(g_slowHostTicks >= 9u, "the VBlanks should keep host time (12 in 200 ms)");
+            const double realCycles = std::chrono::duration<double>(elapsed).count() *
+                                      static_cast<double>(EeScheduler::kEeClockHz);
+            const auto cycle = static_cast<double>(env.runtime.eeScheduler().eeCycle());
+            t.IsTrue(cycle >= 0.75 * realCycles, "the EE clock should keep up with real time");
+            t.IsTrue(cycle <= realCycles + 4916000.0, "the EE clock should not run ahead of real time");
+        });
+
+        tc.Run("Without stall credit, an EE stalled in memory accesses holds the VBlanks back", [](TestCase &t)
+        {
+            TestEnv env;
+            runStallingHost(env, false);
+            const EeScheduler::VBlankCatchUpStats stats = env.runtime.eeScheduler().takeVBlankCatchUpStats();
+            t.Equals(stats.stallCycles, 0ull, "nothing to count");
+            t.IsTrue(g_slowHostTicks <= 6u, "VBlanks wait for the EE's own cycles between them");
+        });
+
+        tc.Run("VBlank catch-up without clock catch-up does not jump the EE clock", [](TestCase &t)
+        {
+            TestEnv env;
+            runSlowHost(env, true, false);
+            const EeScheduler::VBlankCatchUpStats stats = env.runtime.eeScheduler().takeVBlankCatchUpStats();
+            t.IsTrue(g_slowHostTicks >= 9u && g_slowHostTicks <= 12u, "VBlanks should follow host time (12 in 200 ms)");
+            t.IsTrue(stats.caughtUp >= 6u, "most VBlanks should come early");
+            t.IsTrue(stats.skippedCycles > 0u, "the early VBlanks should count the cycles they came early by");
+            t.Equals(stats.dropped, 0ull, "nothing should be dropped this close to host time");
+            t.IsTrue(g_slowHostLargestStep < 10000u, "the EE clock should never jump between guest passes");
+            t.IsTrue(env.runtime.eeScheduler().eeCycle() <= g_slowHostPasses * (kSlowHostPassCycles + 10000u),
+                     "the EE clock should only count the cycles the guest ran");
+        });
+
         tc.Run("VBlank IRQ invocation completes before the resumed base context", [](TestCase &t)
         {
             TestEnv env;
@@ -544,6 +749,28 @@ void register_ps2_runtime_interrupt_tests()
                      "the dispatcher should run wait, IRQ frame, then the resumed base context in exact order");
             t.Equals(g_lastIntcArg.load(std::memory_order_relaxed), 0xCAFEu,
                      "the IRQ frame should receive its registered argument");
+        });
+
+        tc.Run("VU0 registers are shared by threads and IRQ handlers", [](TestCase &t)
+        {
+            TestEnv env;
+            env.runtime.registerFunction(kVu0WaitPc, schedulerVu0Wait);
+            env.runtime.registerFunction(kVu0ResumePc, schedulerVu0Resume);
+            env.runtime.registerFunction(kVu0HandlerPc, schedulerVu0Handler);
+
+            R5900Context mainContext{};
+            mainContext.pc = kVu0WaitPc;
+            env.runtime.eeScheduler().reset(env.rdram.data(), mainContext);
+            env.runtime.eeScheduler().run();
+
+            t.IsTrue(g_vu0HandlerVf5[0] == 1.0f && g_vu0HandlerVf5[1] == 2.0f && g_vu0HandlerVf5[2] == 3.0f &&
+                         g_vu0HandlerVf5[3] == 4.0f,
+                     "the IRQ handler should see the VF registers the thread left");
+            t.Equals(g_vu0HandlerVi3, static_cast<uint16_t>(0x1234u), "the IRQ handler should see the thread's VI registers");
+            t.IsTrue(g_vu0HandlerVf0W == 1.0f, "VF0.w should read 1.0 in an IRQ handler");
+            t.IsTrue(g_vu0ResumedVf6[0] == 5.0f && g_vu0ResumedVf6[1] == 6.0f && g_vu0ResumedVf6[2] == 7.0f &&
+                         g_vu0ResumedVf6[3] == 8.0f,
+                     "the thread should see the VF registers the IRQ handler left");
         });
 
         tc.Run("IRQ callbacks use an isolated invocation stack", [](TestCase &t)

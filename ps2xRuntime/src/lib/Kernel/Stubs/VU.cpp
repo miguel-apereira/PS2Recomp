@@ -72,18 +72,28 @@ namespace ps2_stubs
             return true;
         }
 
+        // One output lane of libvu0's VMULAx/VMADDAy/VMADDAz/VMADDw chain: column[0]*row[0] + ... + column[3]*row[3]
+        // (column is read with the given stride). Each product and sum uses the PS2 float rules, as the VU0 does,
+        // so the PS2's largest values (exponent 255, such as 0x7FFFFFFF) stay numbers: 0 * max is 0, where a host
+        // multiply would turn them into a NaN that then spreads through every matrix built from this one.
+        float vuDot4(const float *column, int stride, const float *row)
+        {
+            float acc = ps2_fmul(column[0], row[0]);
+            for (int k = 1; k < 4; ++k)
+            {
+                acc = ps2_fadd(acc, ps2_fmul(column[k * stride], row[k]));
+            }
+            return acc;
+        }
+
         // Row-major matrix product: out = lhs * rhs (lhs is the left factor).
         void mulVuMatrix(const float (&lhs)[16], const float (&rhs)[16], float (&out)[16])
         {
-            std::fill(std::begin(out), std::end(out), 0.0f);
             for (int i = 0; i < 4; ++i)
             {
                 for (int j = 0; j < 4; ++j)
                 {
-                    for (int k = 0; k < 4; ++k)
-                    {
-                        out[4 * i + j] += rhs[4 * k + j] * lhs[4 * i + k];
-                    }
+                    out[4 * i + j] = vuDot4(&rhs[j], 4, &lhs[4 * i]);
                 }
             }
         }
@@ -220,10 +230,10 @@ namespace ps2_stubs
         {
             // Match libvux VuxApplyMatrix math while honoring the imported EE ABI:
             // a0=out, a1=matrix, a2=vector.
-            out[0] = (matrix[0] * src[0]) + (matrix[4] * src[1]) + (matrix[8] * src[2]) + (matrix[12] * src[3]);
-            out[1] = (matrix[1] * src[0]) + (matrix[5] * src[1]) + (matrix[9] * src[2]) + (matrix[13] * src[3]);
-            out[2] = (matrix[2] * src[0]) + (matrix[6] * src[1]) + (matrix[10] * src[2]) + (matrix[14] * src[3]);
-            out[3] = (matrix[3] * src[0]) + (matrix[7] * src[1]) + (matrix[11] * src[2]) + (matrix[15] * src[3]);
+            for (int i = 0; i < 4; ++i)
+            {
+                out[i] = vuDot4(&matrix[i], 4, src);
+            }
             (void)writeVuVec4f(rdram, dstAddr, out);
         }
         setReturnS32(ctx, 0);

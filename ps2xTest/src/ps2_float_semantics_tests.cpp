@@ -132,6 +132,43 @@ void register_ps2_float_semantics_tests()
             t.Equals(bitsOf(FPU_SQRT_S(twoPow128)), 0x5F800000u, "sqrt(2^128) should be 2^64");
         });
 
+        tc.Run("CVT.W.S rounds toward zero and saturates", [](TestCase &t)
+        {
+            t.Equals(FPU_CVT_W_S(2.7f), 2, "2.7 should convert to 2");
+            t.Equals(FPU_CVT_W_S(2.5f), 2, "2.5 should convert to 2");
+            t.Equals(FPU_CVT_W_S(-2.7f), -2, "-2.7 should convert to -2");
+            t.Equals(FPU_CVT_W_S(0.999f), 0, "0.999 should convert to 0");
+            t.Equals(FPU_CVT_W_S(floatOf(0x00000001u)), 0, "exponent 0 should convert to 0");
+            t.Equals(FPU_CVT_W_S(2147483520.0f), 2147483520, "the largest float below 2^31 should convert exactly");
+            t.Equals(FPU_CVT_W_S(2147483648.0f), INT32_MAX, "2^31 should saturate to 0x7FFFFFFF");
+            t.Equals(FPU_CVT_W_S(-2147483648.0f), INT32_MIN, "-2^31 should give 0x80000000");
+            t.Equals(FPU_CVT_W_S(floatOf(kPlusMax)), INT32_MAX, "+max should saturate to 0x7FFFFFFF");
+            t.Equals(FPU_CVT_W_S(floatOf(kMinusMax)), INT32_MIN, "-max should saturate to 0x80000000");
+            t.Equals(FPU_CVT_W_S(floatOf(kTwoPow128)), INT32_MAX, "2^128 should saturate to 0x7FFFFFFF");
+        });
+
+        tc.Run("compares order exponent 255 as numbers and exponent 0 as zero", [](TestCase &t)
+        {
+            const float plusMax = floatOf(kPlusMax);
+            const float minusMax = floatOf(kMinusMax);
+            const float twoPow128 = floatOf(kTwoPow128);
+            const float minusTwoPow128 = floatOf(0xFF800000u);
+            t.IsTrue(FPU_C_LT_S(1.0f, 2.0f), "1 < 2");
+            t.IsFalse(FPU_C_LT_S(2.0f, 1.0f), "not 2 < 1");
+            t.IsTrue(FPU_C_LT_S(-2.0f, -1.0f), "-2 < -1");
+            t.IsTrue(FPU_C_LT_S(-1.0f, 1.0f), "-1 < 1");
+            t.IsTrue(FPU_C_LT_S(1.0f, plusMax), "1 < +max (a host NaN pattern)");
+            t.IsTrue(FPU_C_LT_S(minusMax, -3.14159f), "-max (a host NaN pattern) < -pi");
+            t.IsTrue(FPU_C_LT_S(twoPow128, plusMax), "2^128 < +max");
+            t.IsTrue(FPU_C_LT_S(minusTwoPow128, -1.0f), "-2^128 < -1");
+            t.IsTrue(FPU_C_LE_S(plusMax, plusMax), "+max <= +max");
+            t.IsTrue(FPU_C_EQ_S(plusMax, plusMax), "+max == +max");
+            t.IsTrue(FPU_C_EQ_S(0.0f, -0.0f), "+0 == -0");
+            t.IsTrue(FPU_C_EQ_S(floatOf(0x00000001u), 0.0f), "exponent 0 compares as zero");
+            t.IsFalse(FPU_C_LT_S(floatOf(0x80000001u), 0.0f), "a negative exponent-0 value is not below zero");
+            t.IsFalse(FPU_C_UN_S(plusMax, 1.0f), "nothing is unordered on the EE");
+        });
+
         tc.Run("FPU results saturate at 0x7FFFFFFF and flush below 2^-126", [](TestCase &t)
         {
             const float maxf = floatOf(kPlusMax);
@@ -158,6 +195,16 @@ void register_ps2_float_semantics_tests()
             t.Equals(bitsOf(FPU_DIV_S(0.0f, 0.0f)), kPlusMax, "0/0 should be +max");
             t.Equals(bitsOf(FPU_DIV_S(1.0f, floatOf(0x00000001u))), kPlusMax, "an exponent-0 divisor should count as zero");
             t.Equals(bitsOf(FPU_DIV_S(6.0f, 3.0f)), bitsOf(2.0f), "ordinary division should be unchanged");
+        });
+
+        tc.Run("PEXEW swaps words 0 and 2, PROT3W rotates words 0-2", [](TestCase &t)
+        {
+            alignas(16) uint32_t out[4];
+            const __m128i in = _mm_setr_epi32(10, 11, 12, 13);
+            _mm_store_si128(reinterpret_cast<__m128i *>(out), PS2_PEXEW(in));
+            t.IsTrue(out[0] == 12 && out[1] == 11 && out[2] == 10 && out[3] == 13, "PEXEW: w0 <- w2, w2 <- w0");
+            _mm_store_si128(reinterpret_cast<__m128i *>(out), PS2_PROT3W(in));
+            t.IsTrue(out[0] == 11 && out[1] == 12 && out[2] == 10 && out[3] == 13, "PROT3W: w0 <- w1, w1 <- w2, w2 <- w0");
         });
 
         tc.Run("FPU RSQRT.S computes fs / sqrt(|ft|) and takes the sign of fs alone on a zero ft", [](TestCase &t)

@@ -1,5 +1,6 @@
 #include "MiniTest.h"
 #include "runtime/ps2_memory.h"
+#include "runtime/ps2_ipu.h"
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/ps2_gs_psmct32.h"
 #include "ps2_runtime.h"
@@ -8,8 +9,12 @@
 #include "Stubs/GS.h"
 
 #include <algorithm>
+#include <thread>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <random>
+#include <string>
 #include <vector>
 
 namespace
@@ -20,6 +25,56 @@ namespace
                (static_cast<uint32_t>(num) << 16) |
                static_cast<uint32_t>(imm);
     }
+
+    // An IPU with the PS2's 8-quadword input FIFO: command N (IPU_CMD) takes
+    // N quadwords, waiting (busy) for those that have not arrived.
+    class FifoIpu final : public PS2IpuDevice
+    {
+    public:
+        explicit FifoIpu(bool limited) : m_limited(limited) {}
+
+        void writeRegister(uint32_t offset, uint32_t value) override
+        {
+            if (offset == 0u)
+            {
+                m_wanted += value;
+                take();
+            }
+        }
+        uint32_t readRegister(uint32_t) override { return m_wanted != 0u ? 0x80000000u : 0u; }
+        void pushInput(const uint8_t *quadwords, uint32_t count) override
+        {
+            m_fifo.insert(m_fifo.end(), quadwords, quadwords + count * 16u);
+            take();
+        }
+        uint32_t inputRoom() const override
+        {
+            if (!m_limited)
+            {
+                return PS2IpuDevice::inputRoom();
+            }
+            const uint32_t held = static_cast<uint32_t>(m_fifo.size() / 16u);
+            return m_wanted != 0u ? m_wanted : (held < 8u ? 8u - held : 0u);
+        }
+        uint32_t outputAvailable() const override { return 0u; }
+        uint32_t popOutput(uint8_t *, uint32_t) override { return 0u; }
+        bool takeInterrupt() override { return false; }
+
+        std::vector<uint8_t> taken;
+
+    private:
+        void take()
+        {
+            const uint32_t count = std::min<uint32_t>(m_wanted, static_cast<uint32_t>(m_fifo.size() / 16u));
+            taken.insert(taken.end(), m_fifo.begin(), m_fifo.begin() + count * 16u);
+            m_fifo.erase(m_fifo.begin(), m_fifo.begin() + count * 16u);
+            m_wanted -= count;
+        }
+
+        bool m_limited;
+        uint32_t m_wanted = 0u;
+        std::vector<uint8_t> m_fifo;
+    };
 
     void setRegU32(R5900Context &ctx, int reg, uint32_t value)
     {
@@ -307,6 +362,128 @@ void register_ps2_memory_tests()
 
             t.Equals(mem.advanceEeTimers(6u), 1u, "Timer0 compare should raise TIM0 after three BUSCLK ticks");
             t.Equals(mem.readIORegister(kTimer0Count), 0u, "ZRET should clear COUNT when it equals COMP");
+        });
+
+        tc.Run("EE timers give the same interrupts and counts whether or not they are read every step", [](TestCase &t)
+        {
+            // advanceEeTimers only adds cycles until the next interrupt is due;
+            // a register read brings the timers up to date. Reading every
+            // COUNT after every step (so they are updated every step) must
+            // give the same interrupts, at the same steps, as never reading them.
+            constexpr uint32_t kTimerBases[] = {0x10000000u, 0x10000800u, 0x10001000u, 0x10001800u};
+            constexpr uint32_t kEquf = 1u << 10u;
+            constexpr uint32_t kOvff = 1u << 11u;
+            std::mt19937 random(20261025u);
+            const auto pick = [&](uint32_t limit) { return static_cast<uint32_t>(random() % limit); };
+            int mismatches = 0;
+            for (int round = 0; round < 40; ++round)
+            {
+                PS2Memory everyStep;
+                PS2Memory atEvents;
+                t.IsTrue(everyStep.initialize() && atEvents.initialize(), "PS2Memory initialize should succeed");
+                const auto write = [&](uint32_t address, uint32_t value)
+                {
+                    everyStep.writeIORegister(address, value);
+                    atEvents.writeIORegister(address, value);
+                };
+                const auto configure = [&](uint32_t base)
+                {
+                    write(base, pick(0x10000u));
+                    write(base + 0x20u, pick(4u) == 0u ? pick(16u) : pick(0x10000u));
+                    // CLKS, ZRET, CUE (mostly on), CMPE, OVFE, and clear both flags.
+                    const uint32_t mode = pick(4u) | (pick(2u) << 6u) | ((pick(5u) != 0u) << 7u) | (pick(2u) << 8u) |
+                                          (pick(2u) << 9u) | kEquf | kOvff;
+                    write(base + 0x10u, mode);
+                };
+                for (const uint32_t base : kTimerBases)
+                    configure(base);
+
+                for (int step = 0; step < 2000; ++step)
+                {
+                    const uint32_t kind = pick(100u);
+                    if (kind < 3u)
+                        configure(kTimerBases[pick(4u)]);
+                    else if (kind < 8u) // acknowledge: write the flags back as ones
+                    {
+                        const uint32_t base = kTimerBases[pick(4u)];
+                        write(base + 0x10u, everyStep.readIORegister(base + 0x10u) | kEquf | kOvff);
+                    }
+                    const uint64_t cycles = pick(50u) == 0u ? pick(600000u) : 1u + pick(pick(2u) ? 64u : 4096u);
+                    const uint32_t a = everyStep.advanceEeTimers(cycles);
+                    const uint32_t b = atEvents.advanceEeTimers(cycles);
+                    for (const uint32_t base : kTimerBases)
+                        (void)everyStep.readIORegister(base);
+                    if (a != b && mismatches++ < 5)
+                        t.Equals(b, a, "round " + std::to_string(round) + " step " + std::to_string(step) +
+                                           ": the same interrupts at the same step");
+                    if (pick(16u) == 0u)
+                    {
+                        const uint64_t until = everyStep.cyclesUntilNextEeTimerInterrupt();
+                        if (until != atEvents.cyclesUntilNextEeTimerInterrupt() && mismatches++ < 5)
+                            t.Equals(atEvents.cyclesUntilNextEeTimerInterrupt(), until,
+                                     "the same cycles until the next interrupt");
+                    }
+                }
+                for (const uint32_t base : kTimerBases)
+                {
+                    for (uint32_t offset = 0u; offset < 0x40u; offset += 0x10u)
+                    {
+                        if (everyStep.readIORegister(base + offset) != atEvents.readIORegister(base + offset) &&
+                            mismatches++ < 5)
+                            t.Equals(atEvents.readIORegister(base + offset), everyStep.readIORegister(base + offset),
+                                     "the same timer registers at the end");
+                    }
+                }
+            }
+            t.Equals(mismatches, 0, "no differences");
+        });
+
+        tc.Run("DMA to the IPU keeps pace with the IPU's input FIFO", [](TestCase &t)
+        {
+            constexpr uint32_t kSource = 0x00100000u;
+            constexpr uint32_t kChcr = 0x1000B400u;
+            constexpr uint32_t kMadr = 0x1000B410u;
+            constexpr uint32_t kQwc = 0x1000B420u;
+            constexpr uint32_t kDStat = 0x1000E010u;
+            for (const bool limited : {true, false})
+            {
+                PS2Memory mem;
+                t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+                FifoIpu ipu(limited);
+                mem.setIpuDevice(&ipu);
+                std::vector<uint8_t> source(64u * 16u);
+                for (size_t i = 0; i < source.size(); ++i)
+                {
+                    source[i] = static_cast<uint8_t>(i * 7u + i / 256u);
+                    mem.write8(kSource + static_cast<uint32_t>(i), source[i]);
+                }
+                mem.writeIORegister(kMadr, kSource);
+                mem.writeIORegister(kQwc, 64u);
+                mem.writeIORegister(kChcr, 0x100u);
+                if (!limited)
+                {
+                    // An IPU that does not say how much it takes gets it all at once.
+                    t.Equals(mem.readIORegister(kChcr) & 0x100u, 0u, "unlimited: the channel finishes at once");
+                    t.IsTrue((mem.readIORegister(kDStat) & (1u << 4u)) != 0u, "unlimited: D_STAT channel 4");
+                    continue;
+                }
+                // Idle: the FIFO fills, and the channel waits.
+                t.Equals(mem.readIORegister(kQwc) & 0xFFFFu, 56u, "8 quadwords fill the idle FIFO");
+                t.Equals(mem.readIORegister(kChcr) & 0x100u, 0x100u, "the channel still runs");
+                t.Equals(mem.readIORegister(kDStat) & (1u << 4u), 0u, "no interrupt yet");
+                t.Equals(mem.readIORegister(kMadr), kSource + 8u * 16u, "MADR follows the data sent");
+                // A command that takes 20: 8 from the FIFO, 12 sent while it waits, then 8 more fill it.
+                mem.writeIORegister(0x10002000u, 20u);
+                t.Equals(mem.readIORegister(kQwc) & 0xFFFFu, 36u, "the command's 12, and the FIFO again");
+                t.Equals(mem.readIORegister(kDStat) & (1u << 4u), 0u, "still no interrupt");
+                // A command that takes the rest finishes the channel.
+                mem.writeIORegister(0x10002000u, 44u);
+                t.Equals(mem.readIORegister(kQwc) & 0xFFFFu, 0u, "all sent");
+                t.Equals(mem.readIORegister(kChcr) & 0x100u, 0u, "the channel finishes once the IPU has its data");
+                t.IsTrue((mem.readIORegister(kDStat) & (1u << 4u)) != 0u, "D_STAT channel 4 then");
+                t.Equals(ipu.taken.size(), source.size(), "the IPU took all the data");
+                t.IsTrue(ipu.taken == source, "the IPU took the data in order");
+            }
         });
 
         tc.Run("scratchpad alias accesses the same bytes as base", [](TestCase &t)
@@ -978,6 +1155,49 @@ void register_ps2_memory_tests()
             t.Equals(order[0], static_cast<uint8_t>(0x11u), "PATH1 should be drained first");
             t.Equals(order[1], static_cast<uint8_t>(0x22u), "PATH2 should be drained second");
             t.Equals(order[2], static_cast<uint8_t>(0x33u), "PATH3 should be drained third");
+        });
+
+        tc.Run("GIF arbiter takes packets from two threads at once", [](TestCase &t)
+        {
+            // VIF1 on its own thread submits and drains PATH1 while the EE
+            // drains after its DMA transfers.
+            constexpr int kPackets = 20000;
+            std::vector<uint8_t> seen;
+            int outOfOrder = 0;
+            GifArbiter arbiter([&](const uint8_t *data, uint32_t sizeBytes)
+            {
+                if (!data || sizeBytes < 16u)
+                    return;
+                uint32_t index = 0;
+                std::memcpy(&index, data + 8, sizeof(index));
+                if (data[0] == 0x11u)
+                {
+                    if (!seen.empty() && index != 0u && seen.back() != static_cast<uint8_t>(index - 1u))
+                        ++outOfOrder;
+                    seen.push_back(static_cast<uint8_t>(index));
+                }
+            });
+            std::atomic<bool> done{false};
+            std::thread ee([&]()
+            {
+                while (!done.load(std::memory_order_acquire))
+                    arbiter.drain();
+            });
+            for (int n = 0; n < kPackets; ++n)
+            {
+                uint8_t packet[16] = {0x11u};
+                const uint32_t index = static_cast<uint32_t>(n);
+                std::memcpy(packet + 8, &index, sizeof(index));
+                arbiter.submit(GifPathId::Path1, packet, sizeof(packet));
+                arbiter.drain();
+            }
+            done.store(true, std::memory_order_release);
+            ee.join();
+            arbiter.drain();
+
+            t.Equals(seen.size(), static_cast<size_t>(kPackets), "every packet should reach the GS once");
+            t.Equals(outOfOrder, 0, "packets from one path should stay in order");
+            t.IsTrue(arbiter.empty(), "nothing should be left queued");
         });
 
         tc.Run("VIF DIRECTHL stalls behind queued PATH3 IMAGE packets", [](TestCase &t)
@@ -1978,6 +2198,47 @@ void register_ps2_memory_tests()
             t.Equals(causes.size(), static_cast<size_t>(1u), "SPR_TO should queue one DMAC completion");
             if (!causes.empty())
                 t.Equals(causes[0], 9u, "SPR_TO completion should use DMAC cause 9");
+        });
+
+        tc.Run("DMAC SPR_TO and SPR_FROM reach VU0 data memory", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+
+            // The Getaway copies VU0 output to the scratchpad from 0x11004800 with CHCR 0x140.
+            constexpr uint32_t kTo = 0x1000D400u;
+            constexpr uint32_t kFrom = 0x1000D000u;
+            constexpr uint32_t kVuOffset = 0x800u;
+            constexpr uint32_t kSadr = 0x2000u;
+            constexpr uint32_t kQwc = 3u;
+            constexpr uint32_t kBytes = kQwc * 16u;
+
+            for (uint32_t i = 0; i < kBytes; ++i)
+                mem.getVU0Data()[kVuOffset + i] = static_cast<uint8_t>(0x30u + i);
+
+            t.IsTrue(mem.writeIORegister(kTo + 0x10u, PS2_VU0_DATA_BASE + kVuOffset), "write SPR_TO MADR should succeed");
+            t.IsTrue(mem.writeIORegister(kTo + 0x20u, kQwc), "write SPR_TO QWC should succeed");
+            t.IsTrue(mem.writeIORegister(kTo + 0x80u, kSadr), "write SPR_TO SADR should succeed");
+            t.IsTrue(mem.writeIORegister(kTo + 0x00u, 0x140u), "start SPR_TO should succeed");
+
+            bool copied = true;
+            for (uint32_t i = 0; i < kBytes; ++i)
+                copied = copied && mem.getScratchpad()[kSadr + i] == static_cast<uint8_t>(0x30u + i);
+            t.IsTrue(copied, "SPR_TO should copy VU0 data memory to the scratchpad");
+            t.Equals(mem.readIORegister(kTo + 0x20u), 0u, "SPR_TO from VU0 memory should consume QWC");
+            t.IsTrue((mem.readIORegister(kTo + 0x00u) & 0x100u) == 0u, "SPR_TO from VU0 memory should clear CHCR.STR");
+
+            for (uint32_t i = 0; i < kBytes; ++i)
+                mem.getScratchpad()[kSadr + i] = static_cast<uint8_t>(0xA0u + i);
+            t.IsTrue(mem.writeIORegister(kFrom + 0x10u, PS2_VU0_DATA_BASE + 0xFF0u), "write SPR_FROM MADR should succeed");
+            t.IsTrue(mem.writeIORegister(kFrom + 0x20u, kQwc), "write SPR_FROM QWC should succeed");
+            t.IsTrue(mem.writeIORegister(kFrom + 0x80u, kSadr), "write SPR_FROM SADR should succeed");
+            t.IsTrue(mem.writeIORegister(kFrom + 0x00u, 0x100u), "start SPR_FROM should succeed");
+
+            bool wrapped = true;
+            for (uint32_t i = 0; i < kBytes; ++i)
+                wrapped = wrapped && mem.getVU0Data()[(0xFF0u + i) % PS2_VU0_DATA_SIZE] == static_cast<uint8_t>(0xA0u + i);
+            t.IsTrue(wrapped, "SPR_FROM should write VU0 data memory, wrapping at its end");
         });
 
         tc.Run("sceDmaReset re-enables DMAC DMAE", [](TestCase &t)

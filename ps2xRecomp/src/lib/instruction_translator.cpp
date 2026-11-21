@@ -129,13 +129,29 @@ namespace ps2recomp
 
         const MemoryAccessHint effectiveMemoryHint = effectiveMemoryHintFor(inst, memoryHint);
 
+        // LQ, SQ, LQC2 and SQC2 ignore the low four bits of the address.
+        auto quadwordHint = [&]()
+        {
+            MemoryAccessHint hint = effectiveMemoryHint;
+            hint.address &= ~0xFu;
+            return hint;
+        };
+        auto quadwordAddress = [](const std::string &addr)
+        {
+            return fmt::format("(({}) & ~0xFu)", addr);
+        };
+
         auto genRead = [&](int width, const std::string &addr)
         {
+            if (width == 128)
+                return translateMemoryRead(inst, quadwordHint(), width, quadwordAddress(addr));
             return translateMemoryRead(inst, effectiveMemoryHint, width, addr);
         };
 
         auto genWrite = [&](int width, const std::string &addr, const std::string &val)
         {
+            if (width == 128)
+                return translateMemoryWrite(inst, quadwordHint(), width, quadwordAddress(addr), val);
             return translateMemoryWrite(inst, effectiveMemoryHint, width, addr, val);
         };
 
@@ -211,6 +227,8 @@ namespace ps2recomp
                 inst.rt,
                 genWrite(32, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate), "bits"));
         case OPCODE_LDC2:
+            if (inst.rt == 0)
+                return "// LQC2 to vf0 ignored: vf0 is always (0,0,0,1)";
             return fmt::format("ctx->vu0_vf[{}] = _mm_castsi128_ps({});", inst.rt, genRead(128, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate)));
         case OPCODE_SDC2:
             return genWrite(128, fmt::format("ADD32(GPR_U32(ctx, {}), {})", inst.rs, inst.simmediate), fmt::format("_mm_castps_si128(ctx->vu0_vf[{}])", inst.rt)) + ";";

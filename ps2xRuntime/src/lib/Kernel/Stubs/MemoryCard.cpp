@@ -80,6 +80,10 @@ namespace ps2_stubs
         {
             std::string currentDir = "/";
             bool formatted = true;
+            // The last sceMcGetDir listing (mode 0) and how far into it the
+            // calls have read: a call with a nonzero mode continues it.
+            std::vector<SceMcTblGetDir> dirListing;
+            size_t dirCursor = 0;
         };
 
         std::mutex g_mcStateMutex;
@@ -319,6 +323,27 @@ namespace ps2_stubs
                                                    kMcAttrExists);
             std::strncpy(entry.EntryName, name.c_str(), sizeof(entry.EntryName) - 1u);
             entry.EntryName[sizeof(entry.EntryName) - 1u] = '\0';
+        }
+
+        // Copies up to maxEntries entries of the port's listing, from where the
+        // last call stopped, to the guest table; the count, or an error.
+        int32_t copyMcDirEntries(uint8_t *rdram, McPortState &state, int32_t maxEntries, uint32_t tableAddr)
+        {
+            const size_t remaining =
+                state.dirCursor < state.dirListing.size() ? state.dirListing.size() - state.dirCursor : 0u;
+            const size_t entryCount = std::min(remaining, maxEntries > 0 ? static_cast<size_t>(maxEntries) : 0u);
+            if (entryCount == 0u || tableAddr == 0u)
+            {
+                return static_cast<int32_t>(entryCount);
+            }
+            uint8_t *dst = getMemPtr(rdram, tableAddr);
+            if (!dst)
+            {
+                return kMcResultDeniedPermit;
+            }
+            std::memcpy(dst, state.dirListing.data() + state.dirCursor, entryCount * sizeof(SceMcTblGetDir));
+            state.dirCursor += entryCount;
+            return static_cast<int32_t>(entryCount);
         }
 
         bool wildcardMatch(const std::string &pattern, const std::string &value)
@@ -699,6 +724,9 @@ namespace ps2_stubs
         const int32_t port = static_cast<int32_t>(getRegU32(ctx, 4));
         const int32_t slot = static_cast<int32_t>(getRegU32(ctx, 5));
         const std::string rawPath = readPs2CStringBounded(rdram, getRegU32(ctx, 6), kMcMaxPathLen);
+        // 0 starts a listing; anything else continues the previous one where
+        // the last call stopped (games read a directory a few entries at a time).
+        const int32_t mode = static_cast<int32_t>(getRegU32(ctx, 7));
         const int32_t maxEntries = static_cast<int32_t>(getRegU32(ctx, 8));
         const uint32_t tableAddr = getRegU32(ctx, 9);
 
@@ -712,6 +740,10 @@ namespace ps2_stubs
                 if (!state.formatted)
                 {
                     result = kMcResultNoFormat;
+                }
+                else if (mode != 0)
+                {
+                    result = copyMcDirEntries(rdram, state, maxEntries, tableAddr);
                 }
                 else
                 {
@@ -821,29 +853,22 @@ namespace ps2_stubs
                             entries.push_back(tableEntry);
                         }
 
-                        const size_t entryCount =
-                            std::min(entries.size(), maxEntries > 0 ? static_cast<size_t>(maxEntries) : 0u);
-                        if (entryCount == 0u || tableAddr == 0u)
-                        {
-                            result = static_cast<int32_t>(entryCount);
-                        }
-                        else if (uint8_t *dst = getMemPtr(rdram, tableAddr))
-                        {
-                            std::memcpy(dst, entries.data(), entryCount * sizeof(SceMcTblGetDir));
-                            result = static_cast<int32_t>(entryCount);
-                        }
-                        else
-                        {
-                            result = kMcResultDeniedPermit;
-                        }
+                        state.dirListing = std::move(entries);
+                        state.dirCursor = 0;
+                        result = copyMcDirEntries(rdram, state, maxEntries, tableAddr);
+                    }
+                    else
+                    {
+                        state.dirListing.clear();
+                        state.dirCursor = 0;
                     }
                 }
             }
 
             setMcCommandResultLocked(kMcCmdGetDir, result);
         }
-        RUNTIME_LOG("[MC] GetDir port=" << port << " '" << rawPath
-                                        << "' maxent=" << maxEntries << " -> result=" << result);
+        RUNTIME_LOG("[MC] GetDir port=" << port << " '" << rawPath << "' mode=" << mode
+                                        << " maxent=" << maxEntries << " -> result=" << result);
         setReturnS32(ctx, 0);
     }
 

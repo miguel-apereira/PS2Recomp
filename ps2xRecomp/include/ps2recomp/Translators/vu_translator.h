@@ -15,6 +15,9 @@ namespace ps2recomp
         std::string translate(const Instruction &inst);
 
     private:
+        std::string translateWithoutEpilogue(const Instruction &inst);
+        static std::string macroEpilogue(const Instruction &inst);
+
         CodeGenerator &m_codeGenerator;
     };
 }

@@ -110,6 +110,13 @@ namespace
 
     thread_local DispatchHistory g_dispatchHistory;
 
+    // Counts the times generated code started to unwind to the scheduler: a
+    // dispatch that did not run its target (checkpoint, jump, missing
+    // function) or a checkpoint at a loop edge. A call whose callee comes back
+    // with the PC still at the callee's entry finished only if this did not
+    // change meanwhile (see dispatchGuestBranch).
+    using ps2_guest::g_guestUnwinds; // see ps2_guest_abi.h
+
     bool computeFileCrc32(const std::string &path, uint32_t &crcOut)
     {
         std::ifstream file(path, std::ios::binary);
@@ -194,6 +201,20 @@ namespace
             return EXCEPTION_VECTOR_BOOT;
         }
         return tlbRefill ? EXCEPTION_VECTOR_TLB_REFILL : EXCEPTION_VECTOR_GENERAL;
+    }
+
+    // The EE FPU and VU0 round toward zero and have no denormals: an operand with exponent 0 is zero and a
+    // result below the smallest normal becomes zero. The thread that runs the game uses the same host mode
+    // (MXCSR round toward zero, flush to zero, denormals are zero), so the host float operations in the game
+    // code give the PS2 results. Threads that run VU1 work for the game copy this mode from it.
+    void setGuestFloatMode()
+    {
+#if defined(_M_X64) || defined(__x86_64__) || defined(_M_IX86) || defined(__i386__)
+        constexpr uint32_t kRoundTowardZero = 0x6000u;
+        constexpr uint32_t kFlushToZero = 0x8000u;
+        constexpr uint32_t kDenormalsAreZero = 0x0040u;
+        _mm_setcsr(_mm_getcsr() | kRoundTowardZero | kFlushToZero | kDenormalsAreZero);
+#endif
     }
 
     void seedVu0IdleSuccess(R5900Context *ctx)
@@ -484,6 +505,17 @@ PS2Runtime::PS2Runtime()
     m_iopSubsystem = std::make_unique<ps2x::iop::IopSubsystem>(*m_iopHost);
 
     m_eeScheduler = std::make_unique<EeScheduler>(*this);
+    // The inline path of direct calls (ps2_guest::dispatchGuestBranch).
+    {
+        ps2_guest::FastDispatch &fast = ps2_guest::g_fastDispatch;
+        fast.table = reinterpret_cast<ps2_guest::GuestFunction *>(g_ps2RecompiledFunctionTable);
+        fast.base = g_ps2RecompiledFunctionTableBase;
+        fast.slots = g_ps2RecompiledFunctionTableSlotCount;
+        fast.stopRequested = &m_stopRequested;
+        m_eeScheduler->exportFastDispatch(fast);
+        fast.enabled = !std::getenv("TGR_TRACE_CALLS") && !std::getenv("TGR_NO_FAST_CALLS") &&
+                       g_ps2RecompiledFunctionTableSlotCount != 0u;
+    }
 
     // Assign rather than memset: R5900Context's constructor zeroes itself and
     // then applies the COP0 reset values, which a memset here would discard.
@@ -636,18 +668,21 @@ ps2x::iop::ModuleLoadResult PS2Runtime::loadIopModule(std::string_view path, con
         return result;
     }
 
+    flushIopCycles();
     auto scope = m_iopHost->enterCall(nullptr, m_memory.getRDRAM());
     return m_iopSubsystem->loadModule(path, arguments, argumentSize);
 }
 
 ps2x::iop::ModuleLoadResult PS2Runtime::loadIopModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize)
 {
+    flushIopCycles();
     auto scope = m_iopHost->enterCall(nullptr, m_memory.getRDRAM());
     return m_iopSubsystem->loadModuleBuffer(guestAddress, arguments, argumentSize);
 }
 
 bool PS2Runtime::stopIopModule(int32_t moduleId, int32_t *result)
 {
+    flushIopCycles();
     auto scope = m_iopHost->enterCall(nullptr, m_memory.getRDRAM());
     return m_iopSubsystem->stopModule(moduleId, result);
 }
@@ -664,6 +699,7 @@ bool PS2Runtime::canBindIopRpc(uint32_t sid) const noexcept
 
 ps2x::iop::RpcResult PS2Runtime::handleIopRpc(uint8_t *rdram, R5900Context *ctx, ps2x::iop::RpcRequest request)
 {
+    flushIopCycles();
     auto scope = m_iopHost->enterCall(ctx, rdram);
     request.callToken = scope.token();
     return m_iopSubsystem->handleRpc(request);
@@ -671,17 +707,28 @@ ps2x::iop::RpcResult PS2Runtime::handleIopRpc(uint8_t *rdram, R5900Context *ctx,
 
 void PS2Runtime::notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransfer &transfer)
 {
+    flushIopCycles();
     auto scope = m_iopHost->enterCall(nullptr, rdram);
     m_iopSubsystem->onSifTransfer(transfer);
 }
 
-void PS2Runtime::advanceIopEeCycles(uint64_t eeCycles) noexcept
+void PS2Runtime::flushIopCycles() noexcept
 {
-    m_iopSubsystem->runEeCycles(eeCycles);
+    static const uint64_t batch = []
+    {
+        const char *value = std::getenv("TGR_IOP_BATCH");
+        return value ? std::max<uint64_t>(1u, std::strtoull(value, nullptr, 0)) : uint64_t{128};
+    }();
+    m_iopBatchEeCycles = batch;
+    const uint64_t cycles = m_iopPendingEeCycles;
+    m_iopPendingEeCycles = 0;
+    if (cycles != 0u)
+        m_iopSubsystem->runEeCycles(cycles);
 }
 
 void PS2Runtime::resetIop()
 {
+    m_iopPendingEeCycles = 0;
     m_iopSubsystem->reset();
 }
 
@@ -738,6 +785,8 @@ bool PS2Runtime::syncCoreSubsystems()
     m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
                                     { m_gs.processGIFPacket(data, size); });
     m_memory.setGifArbiter(&m_gifArbiter);
+    m_memory.setGsDownloadCallback([this](uint8_t *dst, uint32_t size)
+                                   { return m_gs.consumeLocalToHostBytes(dst, size); });
     m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t top, uint32_t itop)
                                  {
                                      R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
@@ -1435,7 +1484,40 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
     }
 }
 
-bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+namespace
+{
+// Debugging aid: TGR_TRACE_CALLS="0x1ED878,0x1EDE48" logs calls to those
+// guest functions (caller and a0-a3), up to 64 times each. Built at start-up:
+// a function-local static would cost a guard check on every guest call.
+struct CallTrace
+{
+    std::unordered_map<uint32_t, int> targets;
+    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    long long afterMs = 0;
+};
+CallTrace *const g_callTrace = []
+{
+    auto *t = new CallTrace();
+    if (const char *list = std::getenv("TGR_TRACE_CALLS"))
+    {
+        for (const char *cursor = list; *cursor;)
+        {
+            char *end = nullptr;
+            const unsigned long value = std::strtoul(cursor, &end, 0);
+            if (end == cursor)
+                break;
+            t->targets[static_cast<uint32_t>(value)] = 0;
+            cursor = (*end == ',') ? end + 1 : end;
+        }
+    }
+    if (const char *after = std::getenv("TGR_TRACE_AFTER_MS"))
+        t->afterMs = std::atoll(after);
+    return t;
+}();
+} // namespace
+
+// Inline into ps2_guest::dispatchGuestBranch, which every guest call goes through.
+__forceinline bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                                      R5900Context *ctx,
                                      uint32_t targetPc,
                                      uint32_t sourcePc,
@@ -1446,37 +1528,14 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     ctx->pc = targetPc;
     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
 
-    // Debugging aid: TGR_TRACE_CALLS="0x1ED878,0x1EDE48" logs calls to those
-    // guest functions (caller and a0-a3), up to 64 times each.
-    static const std::unordered_map<uint32_t, int> *traced = []
+    // Debugging aid: TGR_TRACE_CALLS (see g_callTrace).
+    CallTrace *const trace = g_callTrace;
+    if (isCall && !trace->targets.empty() &&
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - trace->start).count() >=
+            trace->afterMs)
     {
-        auto *targets = new std::unordered_map<uint32_t, int>();
-        if (const char *list = std::getenv("TGR_TRACE_CALLS"))
-        {
-            for (const char *cursor = list; *cursor;)
-            {
-                char *end = nullptr;
-                const unsigned long value = std::strtoul(cursor, &end, 0);
-                if (end == cursor)
-                    break;
-                (*targets)[static_cast<uint32_t>(value)] = 0;
-                cursor = (*end == ',') ? end + 1 : end;
-            }
-        }
-        return targets;
-    }();
-    static const auto traceStart = std::chrono::steady_clock::now();
-    static const long long traceAfterMs = []
-    {
-        const char *after = std::getenv("TGR_TRACE_AFTER_MS");
-        return after ? std::atoll(after) : 0LL;
-    }();
-    if (isCall && !traced->empty() &&
-        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - traceStart).count() >=
-            traceAfterMs)
-    {
-        auto it = const_cast<std::unordered_map<uint32_t, int> *>(traced)->find(targetPc);
-        if (it != traced->end() && it->second++ < 64)
+        auto it = trace->targets.find(targetPc);
+        if (it != trace->targets.end() && it->second++ < 64)
         {
             std::cerr << "[call] 0x" << std::hex << targetPc << " from 0x" << sourcePc << " a0=0x" << GPR_U32(ctx, 4)
                       << " a1=0x" << GPR_U32(ctx, 5) << " a2=0x" << GPR_U32(ctx, 6) << " a3=0x" << GPR_U32(ctx, 7)
@@ -1487,8 +1546,9 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
     // Every inter-function transfer is also a deterministic EE safe point.
     // Backward edges inside generated functions use eeCheckpointDue(), while
     // this charge bounds straight-line call chains that have no local loop.
-    if (m_eeScheduler && m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles))
+    if (m_eeScheduler && m_eeScheduler->checkpointDue(m_eeScheduler->guestCycles(EeScheduler::kGuestDispatchCycles)))
     {
+        ++g_guestUnwinds;
         return false;
     }
 
@@ -1500,10 +1560,15 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         }
 
         ctx->pc = targetPc;
+        ++g_guestUnwinds;
         return false;
     }
 
-    if (!hasFunction(targetPc))
+    // One look in the function table (hasFunction then lookupFunction looked twice).
+    uint32_t targetSlot = 0u;
+    const RecompiledFunction targetFn =
+        generatedFunctionTableSlot(targetPc, targetSlot) ? g_ps2RecompiledFunctionTable[targetSlot] : nullptr;
+    if (targetFn == nullptr)
     {
         reportMissingFunction(rdram, ctx, targetPc, sourcePc, kind, debugName);
 
@@ -1519,14 +1584,17 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
         {
             ctx->pc = targetPc;
             // if you need the app to keep open to open debug pannel change this to false
+            ++g_guestUnwinds;
             return false;
         }
 
+        ++g_guestUnwinds;
         return false;
     }
 
-    RecompiledFunction targetFn = lookupFunction(targetPc);
+    pushDispatchPc(targetPc);
     const uint32_t entryPc = ctx->pc;
+    const uint64_t unwindsBefore = g_guestUnwinds;
     targetFn(rdram, ctx, this);
 
     if (isStopRequested() || ctx->pc == 0u)
@@ -1536,6 +1604,16 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
 
     if (ctx->pc == entryPc)
     {
+        // A host function that leaves the PC alone has finished. Generated
+        // code that comes back with the PC at its own entry is unwinding
+        // instead: it was about to call (or jump to) this same address again,
+        // and a checkpoint stopped it there, as in a recursive call. Treating
+        // that as a return would carry on in this function with the callee's
+        // stack frame and registers.
+        if (g_guestUnwinds != unwindsBefore)
+        {
+            return false;
+        }
         ctx->pc = fallthroughPc;
     }
 
@@ -2355,11 +2433,6 @@ void PS2Runtime::requestStop()
     }
 }
 
-bool PS2Runtime::isStopRequested() const
-{
-    return m_stopRequested.load(std::memory_order_relaxed);
-}
-
 EeScheduler &PS2Runtime::eeScheduler()
 {
     return *m_eeScheduler;
@@ -2377,7 +2450,12 @@ void PS2Runtime::postEeEvent(EeEvent event)
 
 bool PS2Runtime::eeCheckpointDue(uint32_t cycles) noexcept
 {
-    return m_eeScheduler->checkpointDue(cycles);
+    if (!m_eeScheduler->checkpointDue(cycles))
+    {
+        return false;
+    }
+    ++g_guestUnwinds; // the caller returns to the scheduler now
+    return true;
 }
 
 [[noreturn]] void PS2Runtime::eeWaitVSyncTicks(uint32_t ticks, uint32_t resumePc)
@@ -2527,6 +2605,7 @@ void PS2Runtime::startGuest()
     m_guestThread = std::thread([this]()
                            {
         ThreadNaming::SetCurrentThreadName("GameThread");
+        setGuestFloatMode();
         try
         {
             m_eeScheduler->reset(m_memory.getRDRAM(), m_cpuContext);
@@ -2707,21 +2786,34 @@ namespace ps2_guest
         runtime->Store128(rdram, ctx, vaddr, value);
     }
 
-    bool dispatchGuestBranch(PS2Runtime *runtime,
-                             uint8_t *rdram,
-                             R5900Context *ctx,
-                             uint32_t targetPc,
-                             uint32_t sourcePc,
-                             uint32_t fallthroughPc,
-                             Ps2GuestBranchKind kind,
-                             const char *debugName)
+    FastDispatch g_fastDispatch;
+
+    bool dispatchGuestBranchSlow(PS2Runtime *runtime,
+                                 uint8_t *rdram,
+                                 R5900Context *ctx,
+                                 uint32_t targetPc,
+                                 uint32_t sourcePc,
+                                 uint32_t fallthroughPc,
+                                 Ps2GuestBranchKind kind,
+                                 const char *debugName)
     {
         return runtime->dispatchGuestBranch(rdram, ctx, targetPc, sourcePc, fallthroughPc, kind, debugName);
     }
 
     bool eeCheckpointDue(PS2Runtime *runtime, uint32_t cycles) noexcept
     {
-        return runtime->eeCheckpointDue(cycles);
+        // Generated code's own charge: scaled by the EE overclock.
+        return runtime->eeCheckpointDue(runtime->eeScheduler().guestCycles(cycles));
+    }
+
+    uint32_t readCop0Count(PS2Runtime *runtime, R5900Context *ctx) noexcept
+    {
+        return static_cast<uint32_t>(runtime->eeScheduler().eeCycle()) + ctx->cop0_count;
+    }
+
+    void writeCop0Count(PS2Runtime *runtime, R5900Context *ctx, uint32_t value) noexcept
+    {
+        ctx->cop0_count = value - static_cast<uint32_t>(runtime->eeScheduler().eeCycle());
     }
 
     void SignalException(PS2Runtime *runtime, R5900Context *ctx, PS2Exception exception)
