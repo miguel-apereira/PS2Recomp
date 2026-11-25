@@ -123,10 +123,16 @@ namespace
     constexpr uint64_t kVBlankPeriodCycles = microsecondsToEeCycles(16667u);
     constexpr uint64_t kVBlankDurationCycles = microsecondsToEeCycles(500u);
     constexpr uint64_t kAlarmTickCycles = microsecondsToEeCycles(kAlarmTickMicroseconds);
-    // With VBlank catch-up, the EE runs at least this long between VBlanks
-    // (an eighth of a frame), so a backlog after a stall comes at most eight
-    // times as fast as normal and the guest keeps working between them.
+    // With VBlank catch-up, the guest gets at least an eighth of a PS2
+    // frame's work done between VBlanks, so a backlog after a stall comes at
+    // most eight times as fast as normal and the guest keeps working between
+    // them. In PS2 cycles: charged as guestCycles() of it, the same work at
+    // any overclock (at 400% the clock moves 1/4 as much for it).
     constexpr uint64_t kMinVBlankCatchUpCycles = kVBlankPeriodCycles / 8u;
+    // A VBlank already a whole frame late in host time needs only a quarter
+    // of that: a host whose EE does less than an eighth of a PS2 frame's
+    // work per frame still gets its VBlanks on time instead of slow motion.
+    constexpr uint64_t kMinLateVBlankCatchUpCycles = kMinVBlankCatchUpCycles / 4u;
 
     template <typename Map>
     int allocatePositiveId(int &nextId, const Map &objects)
@@ -2249,7 +2255,11 @@ void EeScheduler::processDueDeadlines()
                 // since the last one. The EE clock itself never jumps, so
                 // guest code mid-work (timeouts, COP0 Count, the IOP) sees
                 // continuous time.
-                const uint64_t earliest = m_lastVBlankStartCycle + kMinVBlankCatchUpCycles;
+                const uint64_t earliest =
+                    m_lastVBlankStartCycle + guestCycles(static_cast<uint32_t>(kMinVBlankCatchUpCycles));
+                const uint64_t earliestLate =
+                    m_lastVBlankStartCycle + guestCycles(static_cast<uint32_t>(kMinLateVBlankCatchUpCycles));
+                static const auto kFrame = eeCyclesToHostDuration(kVBlankPeriodCycles);
                 bool lowered = false;
                 for (ScheduledEvent &item : m_deadlines)
                 {
@@ -2257,7 +2267,8 @@ void EeScheduler::processDueDeadlines()
                     {
                         continue;
                     }
-                    const uint64_t cycle = std::max(earliest, m_eeCycle);
+                    const bool frameLate = now - item.hostDeadline >= kFrame;
+                    const uint64_t cycle = std::max(frameLate ? earliestLate : earliest, m_eeCycle);
                     if (cycle < item.deadlineCycle)
                     {
                         m_cyclesSkipped.fetch_add(item.deadlineCycle - cycle, std::memory_order_relaxed);

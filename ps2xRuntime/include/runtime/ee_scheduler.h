@@ -367,9 +367,11 @@ public:
     // VBlank catch-up. Off: a VBlank waits for both its host time and its
     // EE cycles, so an EE that runs slower than the PS2 runs the game in
     // slow motion. On: once a VBlank's host time has passed it fires without
-    // waiting for the rest of its EE cycles (after at least an eighth of a
-    // frame of EE time since the last one), so a slow host drops frames
-    // instead and the game keeps real time. May change while the guest runs.
+    // waiting for the rest of its EE cycles (once the guest has done at
+    // least an eighth of a PS2 frame's work since the last one, whatever the
+    // overclock; a quarter of that once it is a whole frame late), so a slow
+    // host drops frames instead and the game keeps real time. May change
+    // while the guest runs.
     void setVBlankCatchUp(bool enabled) noexcept { m_vblankCatchUp.store(enabled, std::memory_order_relaxed); }
     [[nodiscard]] bool vblankCatchUp() const noexcept { return m_vblankCatchUp.load(std::memory_order_relaxed); }
 
