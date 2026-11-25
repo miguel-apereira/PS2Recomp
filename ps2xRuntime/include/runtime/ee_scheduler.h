@@ -426,6 +426,8 @@ public:
         uint64_t clockCycles = 0;   // EE cycles the clock moved on by (setClockCatchUp)
         uint64_t stallCycles = 0;   // of those, for the EE's stalls (creditStall)
         uint64_t dropped = 0;   // VBlanks dropped because the host fell too far behind
+        uint64_t pacingWaitNs = 0; // host time the EE waited for a due VBlank's host time
+        uint64_t idleWaitNs = 0;   // host time it waited with no guest thread to run
     };
     // Counts since the last call.
     [[nodiscard]] VBlankCatchUpStats takeVBlankCatchUpStats() noexcept;
@@ -655,6 +657,8 @@ private:
     std::atomic<int64_t> m_pendingStallNs{0};
     std::atomic<uint64_t> m_stallCyclesCredited{0};
     std::atomic<uint64_t> m_vblanksDropped{0};
+    std::atomic<uint64_t> m_pacingWaitNs{0}; // VBlankCatchUpStats
+    std::atomic<uint64_t> m_idleWaitNs{0};
 
     mutable std::mutex m_snapshotMutex;
     EeKernelSnapshot m_snapshot;

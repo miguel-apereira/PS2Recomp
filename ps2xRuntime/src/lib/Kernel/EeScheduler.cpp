@@ -171,6 +171,8 @@ EeScheduler::VBlankCatchUpStats EeScheduler::takeVBlankCatchUpStats() noexcept
     stats.clockCycles = m_clockCyclesCaughtUp.exchange(0u, std::memory_order_relaxed);
     stats.stallCycles = m_stallCyclesCredited.exchange(0u, std::memory_order_relaxed);
     stats.dropped = m_vblanksDropped.exchange(0u, std::memory_order_relaxed);
+    stats.pacingWaitNs = m_pacingWaitNs.exchange(0u, std::memory_order_relaxed);
+    stats.idleWaitNs = m_idleWaitNs.exchange(0u, std::memory_order_relaxed);
     return stats;
 }
 
@@ -2308,6 +2310,10 @@ void EeScheduler::processDueDeadlines()
                                      { return !m_events.empty() ||
                                               m_stopRequested.load(std::memory_order_acquire) ||
                                               m_pauseRequested.load(std::memory_order_acquire); });
+                m_pacingWaitNs.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                                   std::chrono::steady_clock::now() - now)
+                                                                   .count()),
+                                         std::memory_order_relaxed);
                 if (!m_events.empty() || m_stopRequested.load(std::memory_order_acquire) ||
                     m_pauseRequested.load(std::memory_order_acquire))
                 {
@@ -2586,9 +2592,14 @@ void EeScheduler::waitForEvent()
     const bool hasTimerDeadline = timerCycles != std::numeric_limits<uint64_t>::max();
     if (m_deadlines.empty() && !hasTimerDeadline)
     {
+        const auto idleStart = std::chrono::steady_clock::now();
         m_eventCv.wait(lock, [this]()
                        { return !m_events.empty() || m_stopRequested.load(std::memory_order_acquire) ||
                                 m_pauseRequested.load(std::memory_order_acquire); });
+        m_idleWaitNs.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                         std::chrono::steady_clock::now() - idleStart)
+                                                         .count()),
+                               std::memory_order_relaxed);
         return;
     }
 
@@ -2623,6 +2634,10 @@ void EeScheduler::waitForEvent()
                                                { return !m_events.empty() ||
                                                         m_stopRequested.load(std::memory_order_acquire) ||
                                                         m_pauseRequested.load(std::memory_order_acquire); });
+    m_idleWaitNs.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                     std::chrono::steady_clock::now() - waitStart)
+                                                     .count()),
+                           std::memory_order_relaxed);
     const float speed = m_speed.load(std::memory_order_relaxed);
     if (signaled && speed > 0.0f && m_vblankCatchUp.load(std::memory_order_relaxed) &&
         m_clockCatchUp.load(std::memory_order_relaxed) && !m_pauseRequested.load(std::memory_order_acquire) &&
