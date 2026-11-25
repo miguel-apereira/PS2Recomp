@@ -449,6 +449,12 @@ public:
     std::vector<PendingTransfer> m_pendingGifTransfers;
     std::vector<PendingTransfer> m_pendingVif0Transfers;
     std::vector<PendingTransfer> m_pendingVif1Transfers;
+    // The processed transfers' buffers, for the next chains (a new one per
+    // DMA kick cost the EE in the heap); a few, bounded in bytes.
+    std::vector<std::vector<uint8_t>> m_spareChainData;
+    std::vector<std::vector<GatherPiece>> m_sparePieces;
+    size_t m_spareChainBytes = 0;
+    void recycleTransfers(std::vector<PendingTransfer> &transfers);
     std::mutex m_completedDmacMutex;
     std::vector<uint32_t> m_completedDmacCauses;
 
