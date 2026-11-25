@@ -25,6 +25,49 @@ uint64_t EeScheduler::takeTransfers() noexcept
 
 namespace
 {
+// Transfers by kind (exit, preempt, invoke, invoke sequence, block + the wait
+// reason) and the guest thread they left (ids 0-63; others counted as 63).
+constexpr int kTransferKinds = 4 + 8;
+constexpr int kTransferThreads = 64;
+std::atomic<uint32_t> g_transferCounts[kTransferKinds][kTransferThreads];
+
+void countTransfer(int kind, int thread)
+{
+    const int t = thread < 0 || thread >= kTransferThreads ? kTransferThreads - 1 : thread;
+    g_transferCounts[kind][t].fetch_add(1, std::memory_order_relaxed);
+}
+} // namespace
+
+std::string EeScheduler::takeTransferBreakdown()
+{
+    static const char *const kKinds[kTransferKinds] = {
+        "exit", "preempt", "invoke", "invoke sequence", "block None", "block Sleep", "block Semaphore",
+        "block EventFlag", "block VSync", "block External", "block Mpeg", "block other"};
+    struct Row
+    {
+        uint32_t count;
+        int kind;
+        int thread;
+    };
+    std::vector<Row> rows;
+    for (int k = 0; k < kTransferKinds; ++k)
+        for (int t = 0; t < kTransferThreads; ++t)
+            if (const uint32_t n = g_transferCounts[k][t].exchange(0u, std::memory_order_relaxed); n != 0u)
+                rows.push_back({n, k, t});
+    std::sort(rows.begin(), rows.end(), [](const Row &a, const Row &b) { return a.count > b.count; });
+    std::string text;
+    for (size_t i = 0; i < rows.size() && i < 4; ++i)
+    {
+        if (!text.empty())
+            text += ", ";
+        text += std::string(kKinds[rows[i].kind]) + " t" + std::to_string(rows[i].thread) + " " +
+                std::to_string(rows[i].count);
+    }
+    return text;
+}
+
+namespace
+{
     // Diagnostics for a guest thread that ends unexpectedly (its PC reaches 0
     // or code that was never compiled): the last times the scheduler ran it,
     // with PC, SP and RA going in and coming out. A return address read from
@@ -906,6 +949,7 @@ int EeScheduler::startThread(int id, uint32_t arg, const R5900Context &caller, b
     }
     publishSnapshot();
     g_eeTransfers.fetch_add(1, std::memory_order_relaxed);
+    countTransfer(0, id);
     throw EeDispatcherTransfer{};
 }
 
@@ -1186,6 +1230,7 @@ void EeScheduler::transferIfRequested(bool interruptSafe)
         return;
     }
     saveVu0();
+    countTransfer(1, m_currentThreadId);
     if (m_currentThreadId != 0)
     {
         GuestThread *self = currentThread();
@@ -1502,6 +1547,7 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
     owner->invocations.push_back(std::move(invocation));
     publishSnapshot();
     g_eeTransfers.fetch_add(1, std::memory_order_relaxed);
+    countTransfer(2, owner->id);
     throw EeDispatcherTransfer{};
 }
 
@@ -1523,6 +1569,7 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
     }
     publishSnapshot();
     g_eeTransfers.fetch_add(1, std::memory_order_relaxed);
+    countTransfer(3, owner->id);
     throw EeDispatcherTransfer{};
 }
 
@@ -2107,6 +2154,7 @@ void EeScheduler::blockCurrent(EeWaitState wait)
     assert(self != nullptr);
     self->wait = std::move(wait);
     self->status = self->suspendCount == 0 ? EeThreadStatus::Waiting : EeThreadStatus::WaitingSuspended;
+    countTransfer(4 + std::min<int>(static_cast<int>(self->wait.reason), 7), self->id);
     m_currentThreadId = 0;
     publishSnapshot();
     g_eeTransfers.fetch_add(1, std::memory_order_relaxed);

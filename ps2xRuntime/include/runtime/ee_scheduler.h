@@ -16,6 +16,7 @@
 #include <thread>
 #include <unordered_map>
 #include <variant>
+#include <string>
 #include <vector>
 
 // This exception is the EE equivalent of a longjmp to the dispatcher.  It is
@@ -264,6 +265,9 @@ public:
     static constexpr int kMainThreadId = 1;
     // Unwinds to the dispatcher (C++ exceptions) since the last call.
     static uint64_t takeTransfers() noexcept;
+    // The transfers since the last call by why and from which guest thread,
+    // the commonest four: "block Semaphore t7 320, preempt t1 300, ...".
+    static std::string takeTransferBreakdown();
     static constexpr int kFirstThreadId = 2;
     static constexpr int kLastThreadId = 255;
     static constexpr int kPriorityCount = 128;
