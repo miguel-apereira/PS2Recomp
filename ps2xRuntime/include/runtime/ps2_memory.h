@@ -451,6 +451,7 @@ public:
     std::vector<PendingTransfer> m_pendingVif1Transfers;
     // The processed transfers' buffers, for the next chains (a new one per
     // DMA kick cost the EE in the heap); a few, bounded in bytes.
+    std::vector<uint8_t> m_gsDownloadScratch; // serviceVif's VIF1 read-backs
     std::vector<std::vector<uint8_t>> m_spareChainData;
     std::vector<std::vector<GatherPiece>> m_sparePieces;
     size_t m_spareChainBytes = 0;
