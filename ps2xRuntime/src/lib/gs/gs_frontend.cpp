@@ -1664,6 +1664,10 @@ bool GS::releaseDeferredSignal()
 {
     if (m_deferredSignalsHeld.load(std::memory_order_acquire) == 0u)
         return false; // nothing held: no need for the lock
+    // The last SIGNAL is still pending (CSR.SIGNAL set): nothing can be
+    // released, and the check under the lock below would say the same.
+    if (m_privRegs && (m_privRegs->csr.load(std::memory_order_acquire) & 0x1u) != 0u)
+        return false;
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     if (m_deferredSignals.empty() || !m_privRegs ||
         (m_privRegs->csr.load(std::memory_order_acquire) & 0x1u) != 0u)

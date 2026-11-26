@@ -665,6 +665,13 @@ void EeScheduler::stepVBlank()
 
 void EeScheduler::waitWhilePaused()
 {
+    // The flag is set under the lock and read again under it below: a
+    // pause requested after this read is seen at the next checkpoint, as
+    // one requested just after the lock would be.
+    if (!m_pauseRequested.load(std::memory_order_acquire))
+    {
+        return;
+    }
     std::unique_lock lock(m_eventMutex);
     if (!m_pauseRequested.load(std::memory_order_acquire))
     {
