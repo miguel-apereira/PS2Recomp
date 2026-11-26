@@ -620,8 +620,14 @@ private:
 
     mutable std::mutex m_eventMutex;
     std::condition_variable m_eventCv;
-    std::deque<EeEvent> m_events;
+    // Events posted by other threads, taken in one swap by
+    // processPendingEvents into m_eventsInFlight; both keep their storage,
+    // so posting and taking them allocates nothing once they have grown.
+    std::vector<EeEvent> m_events;
+    std::vector<EeEvent> m_eventsInFlight;
     std::vector<ScheduledEvent> m_deadlines;
+    // The deadlines processDueDeadlines takes, kept for its storage.
+    std::vector<ScheduledEvent> m_dueDeadlines;
     std::deque<GuestInvocation> m_pendingInvocations;
     uint64_t m_eventSequence = 0;
     uint64_t m_invocationSequence = 0;
@@ -666,5 +672,8 @@ private:
 
     mutable std::mutex m_snapshotMutex;
     EeKernelSnapshot m_snapshot;
+    // The next snapshot is built here, then swapped with m_snapshot: both
+    // keep their vectors' storage, so publishing allocates nothing.
+    EeKernelSnapshot m_snapshotBuild;
     uint64_t m_snapshotSequence = 0;
 };

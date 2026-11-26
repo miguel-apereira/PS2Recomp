@@ -1951,7 +1951,10 @@ EeKernelSnapshot EeScheduler::snapshot() const
 
 void EeScheduler::publishSnapshot()
 {
-    EeKernelSnapshot next{};
+    EeKernelSnapshot &next = m_snapshotBuild;
+    next.threads.clear();
+    next.semaphores.clear();
+    next.eventFlags.clear();
     next.sequence = ++m_snapshotSequence;
     next.eeCycle = m_eeCycle;
     next.sliceEndCycle = m_sliceEndCycle;
@@ -2010,7 +2013,7 @@ void EeScheduler::publishSnapshot()
               { return left.id < right.id; });
     {
         std::lock_guard lock(m_snapshotMutex);
-        m_snapshot = std::move(next);
+        std::swap(m_snapshot, m_snapshotBuild);
     }
 }
 
@@ -2257,15 +2260,18 @@ void EeScheduler::processPendingEvents()
     {
         dispatchIrq(true, static_cast<uint32_t>(std::countr_zero(pending)));
     }
-    std::deque<EeEvent> pending;
+    // Only this thread uses m_eventsInFlight, and nothing processEvent calls
+    // comes back here, so its storage can be kept between calls.
+    m_eventsInFlight.clear();
     {
         std::lock_guard lock(m_eventMutex);
-        pending.swap(m_events);
+        m_eventsInFlight.swap(m_events);
     }
-    for (const EeEvent &event : pending)
+    for (const EeEvent &event : m_eventsInFlight)
     {
         processEvent(event);
     }
+    m_eventsInFlight.clear();
 
     {
         std::lock_guard lock(m_eventMutex);
@@ -2288,9 +2294,12 @@ void EeScheduler::processDueDeadlines()
     // Unlimited speed has no host time to catch up to.
     const float speed = m_speed.load(std::memory_order_relaxed);
     const bool catchUp = m_vblankCatchUp.load(std::memory_order_relaxed) && speed > 0.0f;
+    // Only the executor thread gets here, and nothing processEvent calls
+    // comes back here, so the member's storage can be reused.
+    std::vector<ScheduledEvent> &due = m_dueDeadlines;
     for (;;)
     {
-        std::vector<ScheduledEvent> due;
+        due.clear();
         std::chrono::steady_clock::time_point pacingDeadline{};
         {
             std::unique_lock lock(m_eventMutex);
