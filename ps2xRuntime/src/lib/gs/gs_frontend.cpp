@@ -156,6 +156,7 @@ void GS::reset()
     m_trxreg = {};
     m_trxdir = 3;
     m_deferredSignals.clear();
+    m_deferredSignalsHeld.store(0u, std::memory_order_release);
     m_vtxCount = 0;
     m_vtxIndex = 0;
     m_preferredDisplaySourceFrame = {};
@@ -1484,6 +1485,7 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
                 if (m_deferredSignals.size() >= 256u) // never cleared: keep the newest
                     m_deferredSignals.pop_front();
                 m_deferredSignals.push_back(value);
+                m_deferredSignalsHeld.store(static_cast<uint32_t>(m_deferredSignals.size()), std::memory_order_release);
                 if (++m_deferredSignalCount <= 4u)
                     std::cout << "[gs] SIGNAL while CSR.SIGNAL is set: held until it is cleared ("
                               << m_deferredSignalCount << ")" << std::endl;
@@ -1660,12 +1662,15 @@ bool GS::clearActiveFramebuffer(uint32_t rgba)
 
 bool GS::releaseDeferredSignal()
 {
+    if (m_deferredSignalsHeld.load(std::memory_order_acquire) == 0u)
+        return false; // nothing held: no need for the lock
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     if (m_deferredSignals.empty() || !m_privRegs ||
         (m_privRegs->csr.load(std::memory_order_acquire) & 0x1u) != 0u)
         return false;
     const uint64_t value = m_deferredSignals.front();
     m_deferredSignals.pop_front();
+    m_deferredSignalsHeld.store(static_cast<uint32_t>(m_deferredSignals.size()), std::memory_order_release);
     writeRegisterUnlocked(GS_REG_SIGNAL, value);
     return true;
 }

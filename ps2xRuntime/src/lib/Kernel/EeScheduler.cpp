@@ -25,6 +25,49 @@ uint64_t EeScheduler::takeTransfers() noexcept
 
 namespace
 {
+// Transfers by kind (exit, preempt, invoke, invoke sequence, block + the wait
+// reason) and the guest thread they left (ids 0-63; others counted as 63).
+constexpr int kTransferKinds = 4 + 8;
+constexpr int kTransferThreads = 64;
+std::atomic<uint32_t> g_transferCounts[kTransferKinds][kTransferThreads];
+
+void countTransfer(int kind, int thread)
+{
+    const int t = thread < 0 || thread >= kTransferThreads ? kTransferThreads - 1 : thread;
+    g_transferCounts[kind][t].fetch_add(1, std::memory_order_relaxed);
+}
+} // namespace
+
+std::string EeScheduler::takeTransferBreakdown()
+{
+    static const char *const kKinds[kTransferKinds] = {
+        "exit", "preempt", "invoke", "invoke sequence", "block None", "block Sleep", "block Semaphore",
+        "block EventFlag", "block VSync", "block External", "block Mpeg", "block other"};
+    struct Row
+    {
+        uint32_t count;
+        int kind;
+        int thread;
+    };
+    std::vector<Row> rows;
+    for (int k = 0; k < kTransferKinds; ++k)
+        for (int t = 0; t < kTransferThreads; ++t)
+            if (const uint32_t n = g_transferCounts[k][t].exchange(0u, std::memory_order_relaxed); n != 0u)
+                rows.push_back({n, k, t});
+    std::sort(rows.begin(), rows.end(), [](const Row &a, const Row &b) { return a.count > b.count; });
+    std::string text;
+    for (size_t i = 0; i < rows.size() && i < 4; ++i)
+    {
+        if (!text.empty())
+            text += ", ";
+        text += std::string(kKinds[rows[i].kind]) + " t" + std::to_string(rows[i].thread) + " " +
+                std::to_string(rows[i].count);
+    }
+    return text;
+}
+
+namespace
+{
     // Diagnostics for a guest thread that ends unexpectedly (its PC reaches 0
     // or code that was never compiled): the last times the scheduler ran it,
     // with PC, SP and RA going in and coming out. A return address read from
@@ -123,10 +166,16 @@ namespace
     constexpr uint64_t kVBlankPeriodCycles = microsecondsToEeCycles(16667u);
     constexpr uint64_t kVBlankDurationCycles = microsecondsToEeCycles(500u);
     constexpr uint64_t kAlarmTickCycles = microsecondsToEeCycles(kAlarmTickMicroseconds);
-    // With VBlank catch-up, the EE runs at least this long between VBlanks
-    // (an eighth of a frame), so a backlog after a stall comes at most eight
-    // times as fast as normal and the guest keeps working between them.
+    // With VBlank catch-up, the guest gets at least an eighth of a PS2
+    // frame's work done between VBlanks, so a backlog after a stall comes at
+    // most eight times as fast as normal and the guest keeps working between
+    // them. In PS2 cycles: charged as guestCycles() of it, the same work at
+    // any overclock (at 400% the clock moves 1/4 as much for it).
     constexpr uint64_t kMinVBlankCatchUpCycles = kVBlankPeriodCycles / 8u;
+    // A VBlank already a whole frame late in host time needs only a quarter
+    // of that: a host whose EE does less than an eighth of a PS2 frame's
+    // work per frame still gets its VBlanks on time instead of slow motion.
+    constexpr uint64_t kMinLateVBlankCatchUpCycles = kMinVBlankCatchUpCycles / 4u;
 
     template <typename Map>
     int allocatePositiveId(int &nextId, const Map &objects)
@@ -165,6 +214,8 @@ EeScheduler::VBlankCatchUpStats EeScheduler::takeVBlankCatchUpStats() noexcept
     stats.clockCycles = m_clockCyclesCaughtUp.exchange(0u, std::memory_order_relaxed);
     stats.stallCycles = m_stallCyclesCredited.exchange(0u, std::memory_order_relaxed);
     stats.dropped = m_vblanksDropped.exchange(0u, std::memory_order_relaxed);
+    stats.pacingWaitNs = m_pacingWaitNs.exchange(0u, std::memory_order_relaxed);
+    stats.idleWaitNs = m_idleWaitNs.exchange(0u, std::memory_order_relaxed);
     return stats;
 }
 
@@ -898,6 +949,7 @@ int EeScheduler::startThread(int id, uint32_t arg, const R5900Context &caller, b
     }
     publishSnapshot();
     g_eeTransfers.fetch_add(1, std::memory_order_relaxed);
+    countTransfer(0, id);
     throw EeDispatcherTransfer{};
 }
 
@@ -1178,6 +1230,7 @@ void EeScheduler::transferIfRequested(bool interruptSafe)
         return;
     }
     saveVu0();
+    countTransfer(1, m_currentThreadId);
     if (m_currentThreadId != 0)
     {
         GuestThread *self = currentThread();
@@ -1494,6 +1547,7 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
     owner->invocations.push_back(std::move(invocation));
     publishSnapshot();
     g_eeTransfers.fetch_add(1, std::memory_order_relaxed);
+    countTransfer(2, owner->id);
     throw EeDispatcherTransfer{};
 }
 
@@ -1515,6 +1569,7 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
     }
     publishSnapshot();
     g_eeTransfers.fetch_add(1, std::memory_order_relaxed);
+    countTransfer(3, owner->id);
     throw EeDispatcherTransfer{};
 }
 
@@ -2099,6 +2154,7 @@ void EeScheduler::blockCurrent(EeWaitState wait)
     assert(self != nullptr);
     self->wait = std::move(wait);
     self->status = self->suspendCount == 0 ? EeThreadStatus::Waiting : EeThreadStatus::WaitingSuspended;
+    countTransfer(4 + std::min<int>(static_cast<int>(self->wait.reason), 7), self->id);
     m_currentThreadId = 0;
     publishSnapshot();
     g_eeTransfers.fetch_add(1, std::memory_order_relaxed);
@@ -2249,7 +2305,11 @@ void EeScheduler::processDueDeadlines()
                 // since the last one. The EE clock itself never jumps, so
                 // guest code mid-work (timeouts, COP0 Count, the IOP) sees
                 // continuous time.
-                const uint64_t earliest = m_lastVBlankStartCycle + kMinVBlankCatchUpCycles;
+                const uint64_t earliest =
+                    m_lastVBlankStartCycle + guestCycles(static_cast<uint32_t>(kMinVBlankCatchUpCycles));
+                const uint64_t earliestLate =
+                    m_lastVBlankStartCycle + guestCycles(static_cast<uint32_t>(kMinLateVBlankCatchUpCycles));
+                static const auto kFrame = eeCyclesToHostDuration(kVBlankPeriodCycles);
                 bool lowered = false;
                 for (ScheduledEvent &item : m_deadlines)
                 {
@@ -2257,7 +2317,8 @@ void EeScheduler::processDueDeadlines()
                     {
                         continue;
                     }
-                    const uint64_t cycle = std::max(earliest, m_eeCycle);
+                    const bool frameLate = now - item.hostDeadline >= kFrame;
+                    const uint64_t cycle = std::max(frameLate ? earliestLate : earliest, m_eeCycle);
                     if (cycle < item.deadlineCycle)
                     {
                         m_cyclesSkipped.fetch_add(item.deadlineCycle - cycle, std::memory_order_relaxed);
@@ -2297,6 +2358,10 @@ void EeScheduler::processDueDeadlines()
                                      { return !m_events.empty() ||
                                               m_stopRequested.load(std::memory_order_acquire) ||
                                               m_pauseRequested.load(std::memory_order_acquire); });
+                m_pacingWaitNs.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                                   std::chrono::steady_clock::now() - now)
+                                                                   .count()),
+                                         std::memory_order_relaxed);
                 if (!m_events.empty() || m_stopRequested.load(std::memory_order_acquire) ||
                     m_pauseRequested.load(std::memory_order_acquire))
                 {
@@ -2575,9 +2640,14 @@ void EeScheduler::waitForEvent()
     const bool hasTimerDeadline = timerCycles != std::numeric_limits<uint64_t>::max();
     if (m_deadlines.empty() && !hasTimerDeadline)
     {
+        const auto idleStart = std::chrono::steady_clock::now();
         m_eventCv.wait(lock, [this]()
                        { return !m_events.empty() || m_stopRequested.load(std::memory_order_acquire) ||
                                 m_pauseRequested.load(std::memory_order_acquire); });
+        m_idleWaitNs.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                         std::chrono::steady_clock::now() - idleStart)
+                                                         .count()),
+                               std::memory_order_relaxed);
         return;
     }
 
@@ -2612,6 +2682,10 @@ void EeScheduler::waitForEvent()
                                                { return !m_events.empty() ||
                                                         m_stopRequested.load(std::memory_order_acquire) ||
                                                         m_pauseRequested.load(std::memory_order_acquire); });
+    m_idleWaitNs.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                     std::chrono::steady_clock::now() - waitStart)
+                                                     .count()),
+                           std::memory_order_relaxed);
     const float speed = m_speed.load(std::memory_order_relaxed);
     if (signaled && speed > 0.0f && m_vblankCatchUp.load(std::memory_order_relaxed) &&
         m_clockCatchUp.load(std::memory_order_relaxed) && !m_pauseRequested.load(std::memory_order_acquire) &&

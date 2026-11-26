@@ -16,6 +16,7 @@
 #include <thread>
 #include <unordered_map>
 #include <variant>
+#include <string>
 #include <vector>
 
 // This exception is the EE equivalent of a longjmp to the dispatcher.  It is
@@ -264,6 +265,9 @@ public:
     static constexpr int kMainThreadId = 1;
     // Unwinds to the dispatcher (C++ exceptions) since the last call.
     static uint64_t takeTransfers() noexcept;
+    // The transfers since the last call by why and from which guest thread,
+    // the commonest four: "block Semaphore t7 320, preempt t1 300, ...".
+    static std::string takeTransferBreakdown();
     static constexpr int kFirstThreadId = 2;
     static constexpr int kLastThreadId = 255;
     static constexpr int kPriorityCount = 128;
@@ -367,9 +371,11 @@ public:
     // VBlank catch-up. Off: a VBlank waits for both its host time and its
     // EE cycles, so an EE that runs slower than the PS2 runs the game in
     // slow motion. On: once a VBlank's host time has passed it fires without
-    // waiting for the rest of its EE cycles (after at least an eighth of a
-    // frame of EE time since the last one), so a slow host drops frames
-    // instead and the game keeps real time. May change while the guest runs.
+    // waiting for the rest of its EE cycles (once the guest has done at
+    // least an eighth of a PS2 frame's work since the last one, whatever the
+    // overclock; a quarter of that once it is a whole frame late), so a slow
+    // host drops frames instead and the game keeps real time. May change
+    // while the guest runs.
     void setVBlankCatchUp(bool enabled) noexcept { m_vblankCatchUp.store(enabled, std::memory_order_relaxed); }
     [[nodiscard]] bool vblankCatchUp() const noexcept { return m_vblankCatchUp.load(std::memory_order_relaxed); }
 
@@ -424,6 +430,8 @@ public:
         uint64_t clockCycles = 0;   // EE cycles the clock moved on by (setClockCatchUp)
         uint64_t stallCycles = 0;   // of those, for the EE's stalls (creditStall)
         uint64_t dropped = 0;   // VBlanks dropped because the host fell too far behind
+        uint64_t pacingWaitNs = 0; // host time the EE waited for a due VBlank's host time
+        uint64_t idleWaitNs = 0;   // host time it waited with no guest thread to run
     };
     // Counts since the last call.
     [[nodiscard]] VBlankCatchUpStats takeVBlankCatchUpStats() noexcept;
@@ -653,6 +661,8 @@ private:
     std::atomic<int64_t> m_pendingStallNs{0};
     std::atomic<uint64_t> m_stallCyclesCredited{0};
     std::atomic<uint64_t> m_vblanksDropped{0};
+    std::atomic<uint64_t> m_pacingWaitNs{0}; // VBlankCatchUpStats
+    std::atomic<uint64_t> m_idleWaitNs{0};
 
     mutable std::mutex m_snapshotMutex;
     EeKernelSnapshot m_snapshot;

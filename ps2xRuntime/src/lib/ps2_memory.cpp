@@ -1552,8 +1552,21 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                                         (m_gifPacketCallback || m_gifArbiter != nullptr) &&
                                         m_pendingGifTransfers.empty();
                     std::vector<GatherPiece> pieces;
+                    if (!m_sparePieces.empty())
+                    {
+                        pieces = std::move(m_sparePieces.back());
+                        m_sparePieces.pop_back();
+                        pieces.clear();
+                    }
                     uint32_t pieceBytes = 0;
                     std::vector<uint8_t> chainBuf;
+                    if (!gather && !m_spareChainData.empty())
+                    {
+                        chainBuf = std::move(m_spareChainData.back());
+                        m_spareChainData.pop_back();
+                        m_spareChainBytes -= chainBuf.capacity();
+                        chainBuf.clear(); // keeps its room
+                    }
                     // Room for a chain like the last one: no reallocation (and copy) while it grows.
                     if (!gather)
                         chainBuf.reserve(m_chainBytesHint);
@@ -2005,7 +2018,7 @@ void PS2Memory::processPendingTransfers()
             }
         }
     }
-    m_pendingGifTransfers.clear();
+    recycleTransfers(m_pendingGifTransfers);
 
     const bool hadVif0 = !m_pendingVif0Transfers.empty();
     for (auto &p : m_pendingVif0Transfers)
@@ -2063,7 +2076,7 @@ void PS2Memory::processPendingTransfers()
             }
         }
     }
-    m_pendingVif0Transfers.clear();
+    recycleTransfers(m_pendingVif0Transfers);
 
     const bool hadVif1 = !m_pendingVif1Transfers.empty();
     for (auto &p : m_pendingVif1Transfers)
@@ -2121,7 +2134,7 @@ void PS2Memory::processPendingTransfers()
             }
         }
     }
-    m_pendingVif1Transfers.clear();
+    recycleTransfers(m_pendingVif1Transfers);
 
     // With a PATH3 hook the EE hands the GIF nothing here (the host's
     // thread drains it after each packet), and that thread may be using it.
@@ -2169,6 +2182,24 @@ void PS2Memory::processPendingTransfers()
         m_ioRegisters[VIF1_CHANNEL + 0x00] &= ~0x100u;
         m_ioRegisters[VIF1_CHANNEL + 0x20] = 0;
     }
+}
+
+void PS2Memory::recycleTransfers(std::vector<PendingTransfer> &transfers)
+{
+    constexpr size_t kMaxSpare = 8;
+    constexpr size_t kMaxSpareBytes = size_t{16} << 20;
+    for (PendingTransfer &transfer : transfers)
+    {
+        const size_t bytes = transfer.chainData.capacity();
+        if (bytes != 0 && m_spareChainData.size() < kMaxSpare && m_spareChainBytes + bytes <= kMaxSpareBytes)
+        {
+            m_spareChainBytes += bytes;
+            m_spareChainData.push_back(std::move(transfer.chainData));
+        }
+        if (transfer.pieces.capacity() != 0 && m_sparePieces.size() < kMaxSpare)
+            m_sparePieces.push_back(std::move(transfer.pieces));
+    }
+    transfers.clear();
 }
 
 void PS2Memory::queueCompletedDmacCause(uint32_t cause)
@@ -3051,7 +3082,8 @@ void PS2Memory::serviceVif(int unit)
     if (unit == 1 && (chcrReg & 0x101u) == 0x100u)
     {
         const uint32_t qwc = qwcReg & 0xFFFFu;
-        std::vector<uint8_t> data(static_cast<size_t>(qwc) * 16u, 0u);
+        std::vector<uint8_t> &data = m_gsDownloadScratch; // kept: no allocation per read-back
+        data.assign(static_cast<size_t>(qwc) * 16u, 0u);
         const bool hooked = m_gsDownloadHook && !data.empty() &&
                             m_gsDownloadHook(data.data(), static_cast<uint32_t>(data.size()));
         if (!hooked)

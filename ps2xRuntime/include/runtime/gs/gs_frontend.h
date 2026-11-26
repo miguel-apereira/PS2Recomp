@@ -2,6 +2,7 @@
 #define PS2_GS_FRONTEND_H
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -199,6 +200,9 @@ private:
     struct GSRegisters *m_privRegs = nullptr;
     mutable std::recursive_mutex m_stateMutex;
     std::deque<uint64_t> m_deferredSignals; // SIGNAL values waiting for CSR.SIGNAL to clear
+    // Its size, read without the state lock (releaseDeferredSignal runs at
+    // every EE checkpoint; the lock is the GS stream's).
+    std::atomic<uint32_t> m_deferredSignalsHeld{0};
     uint64_t m_deferredSignalCount = 0u;
     mutable std::mutex m_backendLifetimeMutex;
     mutable std::mutex m_presentationMutex;
