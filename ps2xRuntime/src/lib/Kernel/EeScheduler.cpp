@@ -31,6 +31,11 @@ constexpr int kTransferKinds = 4 + 8;
 constexpr int kTransferThreads = 64;
 std::atomic<uint32_t> g_transferCounts[kTransferKinds][kTransferThreads];
 
+// Passes through processPendingEvents and host clock reads in
+// processDueDeadlines, for the same stats line.
+std::atomic<uint32_t> g_schedulerPasses{0};
+std::atomic<uint32_t> g_deadlineClockReads{0};
+
 void countTransfer(int kind, int thread)
 {
     const int t = thread < 0 || thread >= kTransferThreads ? kTransferThreads - 1 : thread;
@@ -62,6 +67,13 @@ std::string EeScheduler::takeTransferBreakdown()
             text += ", ";
         text += std::string(kKinds[rows[i].kind]) + " t" + std::to_string(rows[i].thread) + " " +
                 std::to_string(rows[i].count);
+    }
+    const uint32_t passes = g_schedulerPasses.exchange(0u, std::memory_order_relaxed);
+    const uint32_t reads = g_deadlineClockReads.exchange(0u, std::memory_order_relaxed);
+    if (passes != 0u)
+    {
+        text += (text.empty() ? "" : "; ") + std::string("scheduler passes ") + std::to_string(passes) +
+                ", deadline clock reads " + std::to_string(reads);
     }
     return text;
 }
@@ -2223,6 +2235,7 @@ void EeScheduler::applyPendingPreemption()
 void EeScheduler::processPendingEvents()
 {
     assertExecutor();
+    g_schedulerPasses.store(g_schedulerPasses.load(std::memory_order_relaxed) + 1u, std::memory_order_relaxed);
     processDueDeadlines();
     const uint32_t timerInterrupts = m_pendingEeTimerInterrupts;
     m_pendingEeTimerInterrupts = 0u;
@@ -2311,6 +2324,8 @@ void EeScheduler::processDueDeadlines()
         {
             std::unique_lock lock(m_eventMutex);
             const auto now = std::chrono::steady_clock::now();
+            g_deadlineClockReads.store(g_deadlineClockReads.load(std::memory_order_relaxed) + 1u,
+                                       std::memory_order_relaxed);
             if (catchUp)
             {
                 // The time the EE stood still in a memory access passed in
