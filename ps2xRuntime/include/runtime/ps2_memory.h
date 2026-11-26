@@ -352,6 +352,9 @@ public:
     void processVIF1Data(const uint8_t *data, uint32_t sizeBytes);
     void processPendingTransfers();
     std::vector<uint32_t> consumeCompletedDmacCauses();
+    // The same into out (cleared first), which hands its storage back for the
+    // next causes. Nothing queued: no lock taken.
+    void consumeCompletedDmacCauses(std::vector<uint32_t> &out);
 
     int pollDmaRegisters();
 
@@ -458,6 +461,8 @@ public:
     void recycleTransfers(std::vector<PendingTransfer> &transfers);
     std::mutex m_completedDmacMutex;
     std::vector<uint32_t> m_completedDmacCauses;
+    // Whether m_completedDmacCauses has any, set and cleared under the mutex.
+    std::atomic<bool> m_completedDmacQueued{false};
 
     struct CodeRegion
     {

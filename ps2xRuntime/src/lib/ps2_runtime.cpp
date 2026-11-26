@@ -1700,9 +1700,16 @@ void PS2Runtime::handleBreak(uint8_t *rdram, R5900Context *ctx)
 
 void PS2Runtime::drainCompletedDmacHandlers(uint8_t *rdram)
 {
-    for (uint32_t cause : m_memory.consumeCompletedDmacCauses())
+    std::vector<uint32_t> causes = std::move(m_dmacCauseSpare);
+    m_memory.consumeCompletedDmacCauses(causes);
+    for (uint32_t cause : causes)
     {
         ps2_syscalls::dispatchDmacHandlersForCause(rdram, this, cause);
+    }
+    causes.clear();
+    if (causes.capacity() > m_dmacCauseSpare.capacity())
+    {
+        m_dmacCauseSpare = std::move(causes);
     }
 }
 

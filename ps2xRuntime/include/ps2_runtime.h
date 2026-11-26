@@ -328,6 +328,9 @@ private:
 
 private:
     PS2Memory m_memory;
+    // drainCompletedDmacHandlers' storage, kept between calls (a handler that
+    // drains again meanwhile uses its own).
+    std::vector<uint32_t> m_dmacCauseSpare;
     GifArbiter m_gifArbiter;
     GS m_gs;
     std::unique_ptr<PS2IopHostAdapter> m_iopHost;

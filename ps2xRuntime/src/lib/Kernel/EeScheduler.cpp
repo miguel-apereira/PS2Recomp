@@ -31,6 +31,11 @@ constexpr int kTransferKinds = 4 + 8;
 constexpr int kTransferThreads = 64;
 std::atomic<uint32_t> g_transferCounts[kTransferKinds][kTransferThreads];
 
+// Passes through processPendingEvents and host clock reads in
+// processDueDeadlines, for the same stats line.
+std::atomic<uint32_t> g_schedulerPasses{0};
+std::atomic<uint32_t> g_deadlineClockReads{0};
+
 void countTransfer(int kind, int thread)
 {
     const int t = thread < 0 || thread >= kTransferThreads ? kTransferThreads - 1 : thread;
@@ -62,6 +67,13 @@ std::string EeScheduler::takeTransferBreakdown()
             text += ", ";
         text += std::string(kKinds[rows[i].kind]) + " t" + std::to_string(rows[i].thread) + " " +
                 std::to_string(rows[i].count);
+    }
+    const uint32_t passes = g_schedulerPasses.exchange(0u, std::memory_order_relaxed);
+    const uint32_t reads = g_deadlineClockReads.exchange(0u, std::memory_order_relaxed);
+    if (passes != 0u)
+    {
+        text += (text.empty() ? "" : "; ") + std::string("scheduler passes ") + std::to_string(passes) +
+                ", deadline clock reads " + std::to_string(reads);
     }
     return text;
 }
@@ -176,6 +188,11 @@ namespace
     // of that: a host whose EE does less than an eighth of a PS2 frame's
     // work per frame still gets its VBlanks on time instead of slow motion.
     constexpr uint64_t kMinLateVBlankCatchUpCycles = kMinVBlankCatchUpCycles / 4u;
+    // A pass through processPendingEvents with nothing flagged checks the
+    // deadlines (and reads the host clock for VBlanks whose host time has
+    // passed) only once this many EE cycles have gone by since the last
+    // check: about 100 microseconds at the EE's clock rate.
+    constexpr uint64_t kFullPassStrideCycles = 29491u;
 
     template <typename Map>
     int allocatePositiveId(int &nextId, const Map &objects)
@@ -343,6 +360,7 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     m_checkpointPending.store(false, std::memory_order_release);
     m_hostDeadlineDue.store(false, std::memory_order_release);
     m_lastVBlankStartCycle = 0u;
+    m_lastFullPassCycle = 0u;
     m_vblanksCaughtUp.store(0u, std::memory_order_relaxed);
     m_cyclesSkipped.store(0u, std::memory_order_relaxed);
     m_vblanksDropped.store(0u, std::memory_order_relaxed);
@@ -665,6 +683,13 @@ void EeScheduler::stepVBlank()
 
 void EeScheduler::waitWhilePaused()
 {
+    // The flag is set under the lock and read again under it below: a
+    // pause requested after this read is seen at the next checkpoint, as
+    // one requested just after the lock would be.
+    if (!m_pauseRequested.load(std::memory_order_acquire))
+    {
+        return;
+    }
     std::unique_lock lock(m_eventMutex);
     if (!m_pauseRequested.load(std::memory_order_acquire))
     {
@@ -1951,7 +1976,10 @@ EeKernelSnapshot EeScheduler::snapshot() const
 
 void EeScheduler::publishSnapshot()
 {
-    EeKernelSnapshot next{};
+    EeKernelSnapshot &next = m_snapshotBuild;
+    next.threads.clear();
+    next.semaphores.clear();
+    next.eventFlags.clear();
     next.sequence = ++m_snapshotSequence;
     next.eeCycle = m_eeCycle;
     next.sliceEndCycle = m_sliceEndCycle;
@@ -2010,7 +2038,7 @@ void EeScheduler::publishSnapshot()
               { return left.id < right.id; });
     {
         std::lock_guard lock(m_snapshotMutex);
-        m_snapshot = std::move(next);
+        std::swap(m_snapshot, m_snapshotBuild);
     }
 }
 
@@ -2213,7 +2241,27 @@ void EeScheduler::applyPendingPreemption()
 void EeScheduler::processPendingEvents()
 {
     assertExecutor();
-    processDueDeadlines();
+    g_schedulerPasses.store(g_schedulerPasses.load(std::memory_order_relaxed) + 1u, std::memory_order_relaxed);
+    // The guest returns here hundreds of thousands of times a second. With
+    // nothing flagged (no event posted, no host deadline passed, no deadline
+    // cycle reached, no stall to credit, no pause) the deadlines have nothing
+    // to do but look for a VBlank whose host time has passed, so that look
+    // (two locks and a clock read) waits until kFullPassStrideCycles have
+    // gone by; the pacer thread flags such a VBlank by itself meanwhile. The
+    // interrupt sources below are still polled at every pass.
+    const uint64_t passNextCycle = m_nextDeadlineCycle.load(std::memory_order_acquire);
+    const bool fullPass = m_checkpointPending.load(std::memory_order_acquire) ||
+                          (passNextCycle != 0u && m_eeCycle >= passNextCycle) ||
+                          m_hostDeadlineDue.load(std::memory_order_acquire) ||
+                          m_pendingStallNs.load(std::memory_order_relaxed) != 0 ||
+                          m_pauseRequested.load(std::memory_order_acquire) ||
+                          m_eeCycle < m_lastFullPassCycle || m_eeCycle - m_lastFullPassCycle >= kFullPassStrideCycles;
+    bool acted = false;
+    if (fullPass)
+    {
+        m_lastFullPassCycle = m_eeCycle;
+        processDueDeadlines();
+    }
     const uint32_t timerInterrupts = m_pendingEeTimerInterrupts;
     m_pendingEeTimerInterrupts = 0u;
     for (uint32_t timer = 0u; timer < 4u; ++timer)
@@ -2221,6 +2269,7 @@ void EeScheduler::processPendingEvents()
         if ((timerInterrupts & (1u << timer)) != 0u)
         {
             dispatchIrq(false, 9u + timer);
+            acted = true;
         }
     }
     {
@@ -2233,6 +2282,7 @@ void EeScheduler::processPendingEvents()
         if (m_runtime.gs().releaseDeferredSignal())
         {
             m_gsIrqRaised &= ~0x1u;
+            acted = true;
         }
         // While INTC cause 0 is disabled the event stays pending (INTC_STAT
         // latches it) and is raised once the cause is enabled again.
@@ -2245,6 +2295,7 @@ void EeScheduler::processPendingEvents()
             if (rising != 0u)
             {
                 dispatchIrq(false, 0u);
+                acted = true;
             }
         }
     }
@@ -2252,20 +2303,32 @@ void EeScheduler::processPendingEvents()
     for (uint32_t pending = m_runtime.memory().takePendingIntc(); pending != 0u; pending &= pending - 1u)
     {
         dispatchIrq(false, static_cast<uint32_t>(std::countr_zero(pending)));
+        acted = true;
     }
     for (uint32_t pending = m_runtime.memory().takePendingDmac(); pending != 0u; pending &= pending - 1u)
     {
         dispatchIrq(true, static_cast<uint32_t>(std::countr_zero(pending)));
+        acted = true;
     }
-    std::deque<EeEvent> pending;
+    if (!fullPass && !acted)
+    {
+        // Nothing posted (m_checkpointPending is clear, so m_events is empty)
+        // and nothing changed that the fast checkpoint window depends on.
+        applyPendingPreemption();
+        return;
+    }
+    // Only this thread uses m_eventsInFlight, and nothing processEvent calls
+    // comes back here, so its storage can be kept between calls.
+    m_eventsInFlight.clear();
     {
         std::lock_guard lock(m_eventMutex);
-        pending.swap(m_events);
+        m_eventsInFlight.swap(m_events);
     }
-    for (const EeEvent &event : pending)
+    for (const EeEvent &event : m_eventsInFlight)
     {
         processEvent(event);
     }
+    m_eventsInFlight.clear();
 
     {
         std::lock_guard lock(m_eventMutex);
@@ -2288,13 +2351,18 @@ void EeScheduler::processDueDeadlines()
     // Unlimited speed has no host time to catch up to.
     const float speed = m_speed.load(std::memory_order_relaxed);
     const bool catchUp = m_vblankCatchUp.load(std::memory_order_relaxed) && speed > 0.0f;
+    // Only the executor thread gets here, and nothing processEvent calls
+    // comes back here, so the member's storage can be reused.
+    std::vector<ScheduledEvent> &due = m_dueDeadlines;
     for (;;)
     {
-        std::vector<ScheduledEvent> due;
+        due.clear();
         std::chrono::steady_clock::time_point pacingDeadline{};
         {
             std::unique_lock lock(m_eventMutex);
             const auto now = std::chrono::steady_clock::now();
+            g_deadlineClockReads.store(g_deadlineClockReads.load(std::memory_order_relaxed) + 1u,
+                                       std::memory_order_relaxed);
             if (catchUp)
             {
                 // The time the EE stood still in a memory access passed in

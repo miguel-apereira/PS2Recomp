@@ -327,6 +327,7 @@ bool PS2Memory::initialize(size_t ramSize)
     {
         std::lock_guard<std::mutex> lock(m_completedDmacMutex);
         m_completedDmacCauses.clear();
+        m_completedDmacQueued.store(false, std::memory_order_release);
     }
     m_codeRegions.clear();
     m_path3Masked = false;
@@ -2206,6 +2207,7 @@ void PS2Memory::queueCompletedDmacCause(uint32_t cause)
 {
     std::lock_guard<std::mutex> lock(m_completedDmacMutex);
     m_completedDmacCauses.push_back(cause);
+    m_completedDmacQueued.store(true, std::memory_order_release);
 }
 
 std::vector<uint32_t> PS2Memory::consumeCompletedDmacCauses()
@@ -2213,7 +2215,22 @@ std::vector<uint32_t> PS2Memory::consumeCompletedDmacCauses()
     std::lock_guard<std::mutex> lock(m_completedDmacMutex);
     std::vector<uint32_t> causes;
     causes.swap(m_completedDmacCauses);
+    m_completedDmacQueued.store(false, std::memory_order_release);
     return causes;
+}
+
+void PS2Memory::consumeCompletedDmacCauses(std::vector<uint32_t> &out)
+{
+    out.clear();
+    // A cause queued on another thread just after this read is taken at the
+    // next call, as one queued just after the lock would be.
+    if (!m_completedDmacQueued.load(std::memory_order_acquire))
+    {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(m_completedDmacMutex);
+    out.swap(m_completedDmacCauses);
+    m_completedDmacQueued.store(false, std::memory_order_release);
 }
 
 void PS2Memory::flushMaskedPath3Packets(bool drainImmediately)
