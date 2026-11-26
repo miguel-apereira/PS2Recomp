@@ -654,6 +654,9 @@ private:
     std::atomic<bool> m_pausedNow{false};
     std::atomic<uint64_t> m_pauseAtTick{0}; // stepVBlank: pause once this VBlank starts
     uint64_t m_lastVBlankStartCycle = 0;
+    // The EE cycle of the last pass that checked the deadlines (see
+    // processPendingEvents).
+    uint64_t m_lastFullPassCycle = 0;
     // Wakes the EE at a VBlank's host time while guest code runs, since
     // checkpoints otherwise look at EE cycles only.
     std::thread m_pacer;

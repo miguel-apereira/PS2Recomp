@@ -188,6 +188,11 @@ namespace
     // of that: a host whose EE does less than an eighth of a PS2 frame's
     // work per frame still gets its VBlanks on time instead of slow motion.
     constexpr uint64_t kMinLateVBlankCatchUpCycles = kMinVBlankCatchUpCycles / 4u;
+    // A pass through processPendingEvents with nothing flagged checks the
+    // deadlines (and reads the host clock for VBlanks whose host time has
+    // passed) only once this many EE cycles have gone by since the last
+    // check: about 100 microseconds at the EE's clock rate.
+    constexpr uint64_t kFullPassStrideCycles = 29491u;
 
     template <typename Map>
     int allocatePositiveId(int &nextId, const Map &objects)
@@ -355,6 +360,7 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     m_checkpointPending.store(false, std::memory_order_release);
     m_hostDeadlineDue.store(false, std::memory_order_release);
     m_lastVBlankStartCycle = 0u;
+    m_lastFullPassCycle = 0u;
     m_vblanksCaughtUp.store(0u, std::memory_order_relaxed);
     m_cyclesSkipped.store(0u, std::memory_order_relaxed);
     m_vblanksDropped.store(0u, std::memory_order_relaxed);
@@ -2236,7 +2242,26 @@ void EeScheduler::processPendingEvents()
 {
     assertExecutor();
     g_schedulerPasses.store(g_schedulerPasses.load(std::memory_order_relaxed) + 1u, std::memory_order_relaxed);
-    processDueDeadlines();
+    // The guest returns here hundreds of thousands of times a second. With
+    // nothing flagged (no event posted, no host deadline passed, no deadline
+    // cycle reached, no stall to credit, no pause) the deadlines have nothing
+    // to do but look for a VBlank whose host time has passed, so that look
+    // (two locks and a clock read) waits until kFullPassStrideCycles have
+    // gone by; the pacer thread flags such a VBlank by itself meanwhile. The
+    // interrupt sources below are still polled at every pass.
+    const uint64_t passNextCycle = m_nextDeadlineCycle.load(std::memory_order_acquire);
+    const bool fullPass = m_checkpointPending.load(std::memory_order_acquire) ||
+                          (passNextCycle != 0u && m_eeCycle >= passNextCycle) ||
+                          m_hostDeadlineDue.load(std::memory_order_acquire) ||
+                          m_pendingStallNs.load(std::memory_order_relaxed) != 0 ||
+                          m_pauseRequested.load(std::memory_order_acquire) ||
+                          m_eeCycle < m_lastFullPassCycle || m_eeCycle - m_lastFullPassCycle >= kFullPassStrideCycles;
+    bool acted = false;
+    if (fullPass)
+    {
+        m_lastFullPassCycle = m_eeCycle;
+        processDueDeadlines();
+    }
     const uint32_t timerInterrupts = m_pendingEeTimerInterrupts;
     m_pendingEeTimerInterrupts = 0u;
     for (uint32_t timer = 0u; timer < 4u; ++timer)
@@ -2244,6 +2269,7 @@ void EeScheduler::processPendingEvents()
         if ((timerInterrupts & (1u << timer)) != 0u)
         {
             dispatchIrq(false, 9u + timer);
+            acted = true;
         }
     }
     {
@@ -2256,6 +2282,7 @@ void EeScheduler::processPendingEvents()
         if (m_runtime.gs().releaseDeferredSignal())
         {
             m_gsIrqRaised &= ~0x1u;
+            acted = true;
         }
         // While INTC cause 0 is disabled the event stays pending (INTC_STAT
         // latches it) and is raised once the cause is enabled again.
@@ -2268,6 +2295,7 @@ void EeScheduler::processPendingEvents()
             if (rising != 0u)
             {
                 dispatchIrq(false, 0u);
+                acted = true;
             }
         }
     }
@@ -2275,10 +2303,19 @@ void EeScheduler::processPendingEvents()
     for (uint32_t pending = m_runtime.memory().takePendingIntc(); pending != 0u; pending &= pending - 1u)
     {
         dispatchIrq(false, static_cast<uint32_t>(std::countr_zero(pending)));
+        acted = true;
     }
     for (uint32_t pending = m_runtime.memory().takePendingDmac(); pending != 0u; pending &= pending - 1u)
     {
         dispatchIrq(true, static_cast<uint32_t>(std::countr_zero(pending)));
+        acted = true;
+    }
+    if (!fullPass && !acted)
+    {
+        // Nothing posted (m_checkpointPending is clear, so m_events is empty)
+        // and nothing changed that the fast checkpoint window depends on.
+        applyPendingPreemption();
+        return;
     }
     // Only this thread uses m_eventsInFlight, and nothing processEvent calls
     // comes back here, so its storage can be kept between calls.
