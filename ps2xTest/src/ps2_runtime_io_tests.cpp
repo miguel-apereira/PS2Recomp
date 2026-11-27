@@ -2,6 +2,7 @@
 #include "ps2_runtime.h"
 #include "ps2_syscalls.h"
 #include "ps2_stubs.h"
+#include "ps2_memory_card_store.h"
 
 #include <filesystem>
 #include <fstream>
@@ -715,6 +716,76 @@ void register_ps2_runtime_io_tests()
             ps2_stubs::sceMcSync(test.rdram.data(), &syncCtx, nullptr);
             t.Equals(getRegS32(&syncCtx, 2), -1,
                      "sceMcSync after sceMcEnd should report that no command is active");
+        });
+
+        tc.Run("libmc makes no card folders until something is written", [](TestCase &t)
+        {
+            TestContext test;
+            const std::filesystem::path fresh = test.paths.base / "fresh";
+            PS2Runtime::IoPaths ioPaths = PS2Runtime::getIoPaths();
+            ioPaths.mcRoot = fresh / "mc0";
+            PS2Runtime::setIoPaths(ioPaths);
+
+            constexpr uint32_t typeAddr = GUEST_BUFFER_AREA_START + 0x900;
+            constexpr uint32_t patternAddr = GUEST_STRING_AREA_START + 0x700;
+            clearContext(test.ctx);
+            ps2_stubs::sceMcInit(test.rdram.data(), &test.ctx, nullptr);
+            for (uint32_t port = 0; port < 2u; ++port)
+            {
+                clearContext(test.ctx);
+                setRegU32(test.ctx, 4, port);
+                setRegU32(test.ctx, 6, typeAddr);
+                ps2_stubs::sceMcGetInfo(test.rdram.data(), &test.ctx, nullptr);
+                t.Equals(syncMc(test.rdram), 0, "both ports should hold a formatted card");
+            }
+
+            writeGuestString(test.rdram.data(), patternAddr, "/*");
+            clearContext(test.ctx);
+            setRegU32(test.ctx, 6, patternAddr);
+            setRegU32(test.ctx, 8, 8u);
+            setRegU32(test.ctx, 9, GUEST_MC_TABLE_ADDR);
+            ps2_stubs::sceMcGetDir(test.rdram.data(), &test.ctx, nullptr);
+            t.Equals(syncMc(test.rdram), 2, "an unused card lists only '.' and '..'");
+            t.IsFalse(std::filesystem::exists(fresh / "mc0"), "looking at a card should not make mc0");
+            t.IsFalse(std::filesystem::exists(fresh / "mc1"), "looking at a card should not make mc1");
+
+            writeGuestString(test.rdram.data(), patternAddr, "/SAVEDATA");
+            clearContext(test.ctx);
+            setRegU32(test.ctx, 6, patternAddr);
+            ps2_stubs::sceMcMkdir(test.rdram.data(), &test.ctx, nullptr);
+            t.Equals(syncMc(test.rdram), 0, "sceMcMkdir should succeed on an unused card");
+            t.IsTrue(std::filesystem::is_directory(fresh / "mc0" / "SAVEDATA"), "writing makes the card folder");
+            t.IsFalse(std::filesystem::exists(fresh / "mc1"), "and leaves the other port's alone");
+        });
+
+        tc.Run("a port without a card store reports no card", [](TestCase &t)
+        {
+            TestContext test;
+            ps2_stubs::setMemoryCardStore(1, nullptr);
+
+            constexpr uint32_t typeAddr = GUEST_BUFFER_AREA_START + 0x900;
+            constexpr uint32_t dirAddr = GUEST_STRING_AREA_START + 0xB00;
+            writeGuestU32(test.rdram.data(), typeAddr, 0xFFFFFFFFu);
+            clearContext(test.ctx);
+            setRegU32(test.ctx, 4, 1u);
+            setRegU32(test.ctx, 6, typeAddr);
+            ps2_stubs::sceMcGetInfo(test.rdram.data(), &test.ctx, nullptr);
+            t.Equals(syncMc(test.rdram), -10, "an empty slot should report no card");
+            t.Equals(readGuestS32(test.rdram.data(), typeAddr), 0, "an empty slot has no card type");
+
+            writeGuestString(test.rdram.data(), dirAddr, "/SAVEDATA");
+            clearContext(test.ctx);
+            setRegU32(test.ctx, 4, 1u);
+            setRegU32(test.ctx, 6, dirAddr);
+            ps2_stubs::sceMcMkdir(test.rdram.data(), &test.ctx, nullptr);
+            t.Equals(syncMc(test.rdram), -10, "writing to an empty slot should report no card");
+
+            clearContext(test.ctx);
+            setRegU32(test.ctx, 6, typeAddr);
+            ps2_stubs::sceMcGetInfo(test.rdram.data(), &test.ctx, nullptr);
+            t.Equals(syncMc(test.rdram), 0, "port 0 keeps its card");
+
+            ps2_stubs::setMemoryCardStore(1, ps2_stubs::createDirectoryMemoryCardStore(1));
         });
 
         tc.Run("sceIoctl cmd1 updates wait flag state", [](TestCase &t)
