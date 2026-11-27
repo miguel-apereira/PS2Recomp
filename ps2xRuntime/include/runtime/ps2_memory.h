@@ -150,6 +150,16 @@ public:
     }
 
     const Entry *find(uint32_t address) const { return const_cast<IoRegisterFile *>(this)->find(address); }
+
+    // The stored word of a flat-table register, 0 if never written. For
+    // diagnostics from another thread: no lock, so it may be a moment old.
+    uint32_t peek(uint32_t address) const
+    {
+        const uint32_t offset = address - PS2_IO_BASE;
+        if (offset < PS2_IO_SIZE && (offset & 3u) == 0u)
+            return m_flat[offset >> 2].second;
+        return 0u;
+    }
     Entry *end() { return nullptr; }
     const Entry *end() const { return nullptr; }
 
@@ -273,6 +283,14 @@ public:
     // Raises INTC causes (a bit per cause) from any thread; the scheduler
     // dispatches them at its next checkpoint.
     void raisePendingIntc(uint32_t causes) { m_pendingIntc.fetch_or(causes, std::memory_order_acq_rel); }
+
+    // For diagnostics from any thread, with no side effect: the INTC causes
+    // raised and not yet taken, whether DMA completions wait to be handed to
+    // the EE, and a register's stored word (readIORegister may sync or pop
+    // FIFOs; this never does).
+    uint32_t peekPendingIntc() const { return m_pendingIntc.load(std::memory_order_acquire); }
+    bool completedDmacQueued() const { return m_completedDmacQueued.load(std::memory_order_acquire); }
+    uint32_t peekIORegister(uint32_t address) const { return m_ioRegisters.peek(address); }
 
     // A host that runs VIF1 and VU1 on a thread of its own installs a hook
     // that waits until that thread has nothing in progress. It is called

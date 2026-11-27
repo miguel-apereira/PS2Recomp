@@ -518,6 +518,9 @@ public:
     void bindMainContextForSyscall(R5900Context &ctx, uint8_t *rdram);
 
     [[nodiscard]] EeKernelSnapshot snapshot() const;
+    // For diagnostics from any thread: whether a posted event or a wake is
+    // waiting for the next full pass.
+    [[nodiscard]] bool checkpointPending() const { return m_checkpointPending.load(std::memory_order_acquire); }
     void publishSnapshot();
 
 private:
